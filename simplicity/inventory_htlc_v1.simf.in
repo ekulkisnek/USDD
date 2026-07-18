@@ -1,0 +1,33 @@
+/*
+ * Inventory-only Elements HTLC V1 -- NONCOMPILED DESIGN TEMPLATE.
+ * Current semantic result: FAIL_CLOSED.
+ */
+
+inventory_htlc_v1 := FAIL_CLOSED
+
+/* Future outline after compiling against a pinned SimplicityHL release:
+ *
+ * constants:
+ *   secretHash = SHA256(SECRET[32])
+ *   claimantScriptHash
+ *   refundScriptHash
+ *   assetId
+ *   amount
+ *   elementsRefundDeadline
+ *
+ * common:
+ *   require(current_input_has_explicit(assetId, amount))
+ *   require(no_issuance_or_reissuance_anywhere())
+ *   require(no_burn_of_protected_asset())
+ *
+ * claim(secret[32]):
+ *   require(sha256(secret) == secretHash)
+ *   require(exact_explicit_output(claimantScriptHash, assetId, amount))
+ *
+ * refund:
+ *   require(absolute_locktime_reached(elementsRefundDeadline))
+ *   require(exact_explicit_output(refundScriptHash, assetId, amount))
+ *
+ * Fees come only from separate policy-asset inputs. The template must be
+ * compiled, CMR-pinned, and transaction-tested before use.
+ */

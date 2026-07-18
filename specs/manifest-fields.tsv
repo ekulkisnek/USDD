@@ -1,0 +1,48 @@
+ordinal	field	type	requirement
+1	schema	u16	1
+2	type_tag	u16	0x4001
+3	ethereum_chain_id	u64	nonzero
+4	ethereum_genesis	bytes32	nonzero
+5	bitcoin_genesis	bytes32	nonzero
+6	elements_genesis	bytes32	nonzero
+7	drivechain_slot	u8	24
+8	usdt	bytes20	nonzero
+9	usdd_asset	bytes32	nonzero
+10	usdd_reissuance_token	bytes32	nonzero
+11	usdd_public_abf	bytes32	nonzero
+12	vault	bytes20	nonzero
+13	vault_id	bytes32	derived constructor commitment
+14	vault_code_hash	bytes32	nonzero
+15	proof_verifier	bytes20	nonzero
+16	proof_verifier_runtime_code_hash	bytes32	nonzero
+17	verifier_config_hash	bytes32	nonzero
+18	ethereum_guest_program_id	bytes32	nonzero
+19	elements_guest_program_id	bytes32	nonzero
+20	sp1_version_major	u16	6
+21	sp1_version_minor	u16	3
+22	sp1_version_patch	u16	1
+23	sp1_git_commit	bytes20	8252c2905ce32964df68248117015c61ebb854db
+24	compressed_proof_circuit_version	u16	1
+25	compressed_proof_codec_version	u16	1
+26	recursion_verifier_constants_hash	bytes32	nonzero
+27	public_digest_tag	u8	1 (SHA-256 only)
+28	bootstrap_finalized_beacon_slot	u64	nonzero
+29	bootstrap_finalized_beacon_root	bytes32	nonzero
+30	bootstrap_execution_state_root	bytes32	nonzero
+31	bootstrap_eth_light_client_digest	bytes32	nonzero
+32	controller_cmr	bytes32	nonzero
+33	controller_configuration_hash	bytes32	derived USDD/1/controller-config projection
+34	domain_separator_table_hash	bytes32	computed V1 table commitment
+35	issuance_txid_display	bytes32	nonzero display-order txid
+36	issuance_vout	u32	deployment-fixed
+37	asset_entropy	bytes32	nonzero
+38	initial_controller_state_hash	bytes32	SHA256(exact 164-byte initial state)
+39	active_liability_cap_usdt_micro	u64	frozen V1 cap
+40	minimum_activation_chainwork	bytes32	nonzero big-endian chainwork
+41	max_ethereum_finality_slot_gap	u64	4096
+42	max_finalized_to_bmm_mtp_age_seconds	u64	21600
+43	minimum_bitcoin_confirmations	u32	at least 100
+44	first_deposit_nonce	u64	0 (fresh immutable vault)
+45	usdt_display_decimals	u8	6
+46	usdd_display_decimals	u8	8
+47	usdd_units_per_usdt_micro	u64	100

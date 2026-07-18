@@ -1,0 +1,45 @@
+/*
+ * USDD singleton mint controller V1 -- NONCOMPILED DESIGN TEMPLATE.
+ *
+ * This is deliberately not deployable SimplicityHL. The only current semantic
+ * result is FAIL_CLOSED. Never replace it with a host-language helper or a
+ * boolean verifier stub.
+ */
+
+controller_v1 := FAIL_CLOSED
+
+/* Future outline, after upstream consensus primitives exist:
+ *
+ * current = committed_controller_state()
+ * require(current.version == 1)
+ * require(current.configHash == IMMUTABLE_CONFIG_HASH)
+ * require(authenticated_bmm_parent_mtp_is_present())
+ *
+ * annex = bounded_owned_current_annex(max = 512 KiB)
+ * require(annex_hash_matches_transaction(annex))
+ * envelope = parse_usdd_sp1_v1(annex)
+ * require(envelope.statementKind == ETH_STATE_V1)
+ * require(envelope.guestVkeyHash == ETHEREUM_GUEST_VKEY_HASH)
+ * journal = verify_sp1_compressed_v1(envelope)
+ *
+ * require(journal.priorState == current)
+ * if journal.isMint:
+ *   require(1 <= journal.depositCount && journal.depositCount <= 64)
+ *   require(deposits_are_consecutive_from(journal, current.nextMintNonce))
+ *   require(all_amounts_use_checked_usdt6_times_100(journal))
+ *   require(exact_native_usdd_reissuance_and_recipient_outputs(journal))
+ * else if journal.isHeartbeat:
+ *   require(journal.depositCount == 0)
+ *   require(strictly_newer_finalized_ethereum_state(journal))
+ *   require(nextMintNonce_and_totalMinted_unchanged(journal))
+ *   require(zero_issuance_reissuance_and_usdd_outputs())
+ * else fail
+ * require(unique_successor_state_is_exact(journal.nextState))
+ * require(all_reissuance_tokens_return_to_successor())
+ * require(no_other_controller_successor())
+ * succeed
+ *
+ * The SP1 verifier requires an upstream jet specification/CMR/generated
+ * dispatch/type/cost/activation. Raw proof bytes require bounded txEnv ownership
+ * and annex-hash binding. Neither exists in the current released code.
+ */

@@ -1,0 +1,12 @@
+[package]
+name = "usdd-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dependency-light inspection and audit CLI for USDD V1"
+
+[dependencies]
+usdd-core = { workspace = true, features = ["std"] }
+usdd-proof-core.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "usdd-proof-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Strict proof journals and verifier boundaries for the USDD V1 bridge"
+
+[features]
+default = ["std"]
+std = ["usdd-core/std"]
+
+[dependencies]
+usdd-core = { workspace = true, default-features = false }

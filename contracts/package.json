@@ -1,0 +1,16 @@
+{
+  "name": "usdd-ethereum-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-manifest.mjs",
+    "check:build": "node scripts/build-manifest.mjs --check",
+    "test": "node scripts/build-manifest.mjs --check && node test/run-tests.mjs"
+  },
+  "devDependencies": {
+    "@noble/hashes": "1.8.0",
+    "ganache": "7.9.2",
+    "solc": "0.8.30"
+  }
+}

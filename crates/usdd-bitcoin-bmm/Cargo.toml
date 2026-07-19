@@ -1,0 +1,17 @@
+[package]
+name = "usdd-bitcoin-bmm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fail-closed Bitcoin header and slot-24 BIP301 primitives for the USDD outbound proof"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+bitcoin_hashes = { version = "=0.14.101", default-features = false }
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa"] }
+sha2 = { workspace = true }

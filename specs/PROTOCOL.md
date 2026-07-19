@@ -38,18 +38,28 @@ V1 has one singleton controller state per vault and one sequential nonce.
 1. A user transfers USDT into the immutable vault through its deposit entry
    point. The vault records the amount, Elements recipient, and the next
    sequential per-vault nonce. The deposit is permanent; it has no timeout or
-   unilateral refund after acceptance.
+   unilateral refund after acceptance. Each deposit is at least one micro-USDT
+   and at most 20,000,000 USDT; active liabilities are capped at
+   1,000,000,000 USDT.
 2. Any prover constructs a proof of finalized Ethereum consensus and execution
    state rooted at the manifest's Ethereum genesis. The proved state must show
    the exact vault code and exact deposit record.
-3. The proof journal binds the manifest ID, 1..64 consecutive deposit
-   records, the prior controller state, and the currently expected nonce. The strict envelope requires SHA-256, the
+3. The typed proof journal binds the manifest ID, 1..64 consecutive deposit
+   records, the prior controller state, the currently expected nonce, and the
+   Ethereum-proved execution timestamp. It cannot contain a prover-selected
+   BMM timestamp. The strict envelope requires SHA-256, the
    fixed success marker, the manifest's program ID, canonical encoding, and no
-   trailing bytes.
+   trailing bytes. A single mint batch is capped at 20,000,000 USDT /
+   2,000,000,000,000,000 USDD base units. This leaves
+   100,000,000,000,000 explicit-value units below Elements' transaction-wide
+   `MAX_MONEY` sum for the reissuance-token successor, fee, and non-protocol
+   change outputs.
 4. An Elements mint transaction spends the unique controller UTXO. Its
    Simplicity policy accepts only consecutive nonces beginning at `N`, creates
    each exact `amount_micro × 100` native USDD output, and recreates the
-   controller state with `N + batch_length`.
+   controller state with `N + batch_length`. It separately obtains the current
+   BMM-parent MTP from authenticated Elements validation context and requires
+   it to be within six hours of the proved Ethereum timestamp.
 5. Because the controller UTXO is unique and the nonce advances exactly once,
    replayed and out-of-order deposits cannot mint.
 
@@ -71,8 +81,9 @@ launch.
    the Bitcoin/BMM relation and the manifest's required Bitcoin confirmations.
    A BMM commitment alone proves neither the Elements state transition nor the
    burn.
-4. The proof advances the Ethereum vault's authenticated Elements state and
-   cumulative depth-64 burn root. A claim supplies the exact 64-sibling branch;
+4. The proof advances the Ethereum vault's authenticated Elements state,
+   including the full consensus/UTXO-state digest needed for the next proof,
+   and cumulative depth-64 burn root. A claim supplies the exact 64-sibling branch;
    the vault verifies membership and pays exactly `usdd_base / 100`
    micro-USDT to the committed destination. Contiguous burn indices and the
    paid bitmap prevent replay.

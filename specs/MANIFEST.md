@@ -1,6 +1,6 @@
 # Deployment manifest
 
-`ProtocolManifest` is a canonical binary record (schema 1, tag `0x4001`). It is
+`ProtocolManifest` is a canonical binary record (schema 2, tag `0x4001`). It is
 committed with the `USDD/1/manifest` domain hash. Every proof claim and public
 output carries that commitment; verifiers must compare it with the immutable
 deployment value.
@@ -28,6 +28,14 @@ projection of the Ethereum mint-proof configuration. It is not the full
 manifest ID: the full manifest includes that hash and the initial controller
 state hash. `ProtocolManifest::validate` recomputes both the controller
 configuration hash and initial state hash before accepting the manifest.
+
+The outbound verifier configuration hash is also derived, never merely
+nonzero. Its non-circular projection binds the Bitcoin and Elements genesis
+identities, slot 24, Ethereum chain/vault address, USDD asset, Elements guest
+program, SP1 circuit/codec/recursion identity, SHA-256 mode, domain table,
+activation chainwork, confirmation depth, and the fixed depth-64/64-append burn
+policy. The verifier runtime address and code hash are pinned separately to
+avoid a runtime-literal self-reference.
 
 No production manifest is included because the required guest program IDs and
 deployment code hashes have not been built and measured. Publishing placeholder

@@ -23,7 +23,12 @@ This document is normative for the Solidity/Rust boundary. All concatenations be
 
 USDT amounts use six-decimal micro-units (`amountUSDT6`) and are encoded as
 `uint64` at the bridge boundary. Elements USDD uses eight-decimal base units;
-the exact corresponding output value is `amountUSDT6 * 100`.
+the exact corresponding output value is `amountUSDT6 * 100`. One deposit and
+one mint batch may contain at most 20,000,000 USDT. This retains
+100,000,000,000,000 explicit-value units below Elements' transaction-wide
+21,000,000 × 10^8 sum for the authority-token successor, fees, and change.
+One canonical burn has the same 20,000,000-USDT ceiling so its transaction can
+also include an explicit fee output.
 
 ## Vault ID
 
@@ -64,10 +69,10 @@ depositId = SHA256(
 )
 ```
 
-The V1 mapping is at Solidity storage slot 11. Its storage-proof key is:
+The V1 mapping is at Solidity storage slot 12. Its storage-proof key is:
 
 ```text
-keccak256(abi.encode(uint64(nonce), uint256(11)))
+keccak256(abi.encode(uint64(nonce), uint256(12)))
 ```
 
 Here `abi.encode`, unlike `abi.encodePacked`, pads both mapping-key inputs to 32 bytes. The value at that key is the 32-byte `depositId`. This slot number is specific to the immutable `USDDVaultV1` source/layout and must be checked again if the source or compiler layout changes. The `DepositAccepted` event also emits the raw script, its SHA-256 hash, the salt, amount, nonce, depositor, and commitment.
@@ -80,6 +85,7 @@ Here `abi.encode`, unlike `abi.encodePacked`, pads both mapping-key inputs to 32
 (uint64 sequence,
  uint64 burnCount,
  bytes32 elementsTipHash,
+ bytes32 elementsConsensusStateDigest,
  bytes32 cumulativeBurnRoot,
  bytes32 finalizedBitcoinBlockHash,
  uint64 bitcoinHeight,
@@ -95,6 +101,7 @@ contents(s) = SHA256(
     u64be(s.sequence)
  || u64be(s.burnCount)
  || s.elementsTipHash
+ || s.elementsConsensusStateDigest
  || s.cumulativeBurnRoot
  || s.finalizedBitcoinBlockHash
  || u64be(s.bitcoinHeight)
@@ -133,12 +140,12 @@ The ABI is:
 
 ```text
 advanceElementsState(
-  (uint64,uint64,bytes32,bytes32,bytes32,uint64,uint64,uint64,uint256) next,
+  (uint64,uint64,bytes32,bytes32,bytes32,bytes32,uint64,uint64,uint64,uint256) next,
   bytes proof
 )
 ```
 
-The contract requires `next.sequence == old.sequence + 1`, nondecreasing `burnCount`, increasing heights/chainwork, and valid immutable-verifier proof. Solidity invokes the `view` verifier through `STATICCALL`; before every call it rechecks that the verifier's `EXTCODEHASH` equals the hash pinned in the constructor.
+The contract requires `next.sequence == old.sequence + 1`, burn-count growth of at most 64, the canonical `EMPTY[64]` root whenever `burnCount == 0`, a nonzero consensus-state digest, increasing heights/chainwork, and a valid immutable-verifier proof. `elementsConsensusStateDigest` is the proof-program-defined commitment to the complete finalized Elements consensus state needed to continue validation; it is distinct from the block hash and must never be zero. Solidity invokes the `view` verifier through `STATICCALL`; before every call it rechecks that the verifier's `EXTCODEHASH` equals the hash pinned in the constructor.
 
 The verifier interface additionally exposes `verifierProgramId()` and `verifierConfigHash()`. The vault requires both to equal constructor-supplied expected values at deployment and rechecks both before every proof. The config hash must commit every proof parameter not already captured by the program ID. This identity binding does not make proxies, `DELEGATECALL` targets, mutable storage, or external verifier dependencies immutable; production remains blocked until the pinned verifier is a self-contained audited wrapper without those paths.
 
@@ -272,12 +279,12 @@ USDTHTLC(
   address refundRecipient,
   uint256 amount,
   bytes32 secretHash,
-  uint64 elementsRefundTimestamp,
+  uint32 elementsRefundTimestamp,
   uint64 externalRefundTimestamp
 )
 ```
 
-It rejects deployment unless:
+It rejects deployment if a fixed endpoint is the escrow itself or if the claim and refund recipients are identical. The Elements timestamp is a `uint32`, matching the absolute timestamp representation enforced on the Elements side. It also rejects deployment unless:
 
 ```text
 externalRefundTimestamp >= elementsRefundTimestamp + 24 hours

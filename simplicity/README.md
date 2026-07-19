@@ -2,8 +2,8 @@
 
 Status: **fail closed and not deployable**.
 
-See [`BUILD_BLOCKERS.md`](BUILD_BLOCKERS.md) for the mandatory new-network,
-consensus-verifier, proof-guest, policy, and activation checklist.
+See [`BUILD_BLOCKERS.md`](BUILD_BLOCKERS.md) for the mandatory sole-network
+identity, consensus-verifier, proof-guest, policy, and activation checklist.
 
 This directory covers the locked Ethereum-only V1 and one separate
 inventory-swap HTLC. It does not define a Tron vault, Tron mint path, Tron
@@ -26,14 +26,20 @@ liveness, never authorization. The two chain transitions are not simultaneous,
 so “atomic swap” is not accurate for the canonical bridge.
 
 Tron is inventory-only in V1: counterparties may use independent HTLCs to swap
-existing USDD against existing Tron USDT. That flow cannot mint USDD, release
-the Ethereum vault, or share the canonical controller. See
+existing USDD against existing Tron USDT. The Elements side now has a
+source-only SimplicityHL hashlock/timelock template with fixed claimant and
+refund keys. That flow cannot mint USDD, release the Ethereum vault, or share
+the canonical controller, and it remains undeployable until exact compiler/node
+compatibility and transaction execution are demonstrated. See
 `INVENTORY_HTLC_V1.md`.
 
 ## Locked monetary and state rules
 
 - Ethereum USDT has six decimals; native USDD has eight decimals.
 - `USDD8 = USDT6 * 100`, checked in `u64` arithmetic.
+- One deposit, one mint batch, and one burn contain at most 20,000,000 USDT,
+  preserving transaction-wide Elements explicit-output headroom for the
+  controller token, fees, and change.
 - Exactly one controller exists.
 - A mint transition consumes 1..64 deposits whose vault nonces are consecutive,
   start at `nextMintNonce`, and appear in increasing order.
@@ -44,24 +50,33 @@ the Ethereum vault, or share the canonical controller. See
 - Controller state contains exactly: `version`, `sequence`, `nextMintNonce`,
   Ethereum light-client digest, finalized beacon slot and root, execution root,
   `totalMinted`, and configuration hash. It has no `totalBurned` field.
+- The typed Ethereum journal carries the execution-block timestamp proved by
+  Ethereum consensus. It carries no caller-supplied BMM MTP. The controller
+  obtains the current parent MTP only from the authenticated Elements block
+  environment and requires an absolute difference of at most six hours.
 - Burns do not spend or update the mint controller.
 
 ## Hard blockers before activation
 
-- **No SP1 verifier jet:** envelope parsing is not proof verification. A verifier
-  must be added as a real upstream Simplicity jet with a specified type, CMR,
-  generated C/Haskell identifiers and dispatch, deterministic cost, activation,
-  and independent vectors. A local C helper is not sufficient.
-- **Raw annex bytes are unavailable to jets:** `rawElementsInput` receives an
-  annex, but `simplicity_elements_mallocTransaction`/`copyInput` keeps only its
-  hash. The environment must own a bounded copy (maximum 512 KiB), bind it to
-  `annexHash`, define allocation/lifetime behavior, and charge deterministic
-  memory and verification cost.
-- **Authenticated block context:** `current_bmm_parent_mtp` may be marked present
-  only after the node ties the mainchain parent to the sidechain block through a
-  mined BIP301 commitment. Block script-cache keys must include it. Mempool and
-  template validation need an explicit candidate-parent context; wall clock
-  time and an unbound RPC response are invalid substitutes.
+- **No SP1 verifier jet:** envelope parsing is not proof verification. A
+  `verify_sp1_compressed_sha256(programId, publicValuesHash) -> Bit`
+  environmental verifier must be added as a real upstream Simplicity jet with
+  a specified type, CMR, generated C/Haskell identifiers and dispatch, fixed
+  worst-case cost, activation, and independent vectors. It reads the exact
+  bounded annex internally and matches the hash of its public values. The
+  controller separately hashes the same typed journal. A generic annex-byte
+  jet and a local host callback are both deliberately excluded.
+- **Authenticated block context policy:** the future
+  controller must require `Some` from the generated
+  `current_bmm_parent_mtp : 1 -> Maybe Word64` jet. The node now pins decoder
+  item 51, CMR
+  `12dc3d4f22466873daaf83b10e1cfa1ea551e23ae7d0fbd6d9da64ce7e89a3e2`,
+  and cost 108 from the official upstream generator. Mempool and template
+  validation must continue to use explicit candidate-parent context; wall
+  clock time, an Ethereum-guest input, a journal field purporting to be parent
+  MTP, and an unbound RPC response remain invalid substitutes. The controller,
+  not the Ethereum guest, compares the jet value with the journal's proved
+  Ethereum execution timestamp.
 - **Controller state commitment:** a prototype must demonstrate that released
   Elements introspection jets can authenticate the current state, all mint
   outputs, and one exact successor while keeping every reissuance-token unit in

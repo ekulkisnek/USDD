@@ -137,10 +137,10 @@ pub const DOMAIN_SEPARATOR_TABLE_V1: &str = concat!(
     "USDD/1/merkle-node\n",
     "USDD/1/manifest\n",
     "USDD/1/controller-config\n",
+    "USDD/1/outbound-verifier-config\n",
     "USDD/1/claim/ethereum-state\n",
     "USDD/1/claim/elements-event\n",
     "USDD/1/public/deposit\n",
-    "USDD/1/public/redemption\n",
     "keccak256:USDD_VAULT_ID_V1\n",
     "keccak256:USDD_DEPOSIT_ID_V1\n",
     "keccak256:USDD_ELEMENTS_STATE_V1\n",
@@ -178,10 +178,10 @@ pub enum Domain {
     MerkleNode,
     Manifest,
     ControllerConfig,
+    OutboundVerifierConfig,
     EthereumStateClaim,
     ElementsEventClaim,
     DepositPublicOutput,
-    RedemptionPublicOutput,
 }
 
 impl Domain {
@@ -192,10 +192,10 @@ impl Domain {
             Self::MerkleNode => "USDD/1/merkle-node",
             Self::Manifest => "USDD/1/manifest",
             Self::ControllerConfig => "USDD/1/controller-config",
+            Self::OutboundVerifierConfig => "USDD/1/outbound-verifier-config",
             Self::EthereumStateClaim => "USDD/1/claim/ethereum-state",
             Self::ElementsEventClaim => "USDD/1/claim/elements-event",
             Self::DepositPublicOutput => "USDD/1/public/deposit",
-            Self::RedemptionPublicOutput => "USDD/1/public/redemption",
         }
     }
 }

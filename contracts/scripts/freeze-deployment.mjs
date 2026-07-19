@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { keccak_256 } from "@noble/hashes/sha3";
 
+import { analyzeVerifierRuntime, validatePreflightEvidence } from "./verifier-preflight.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function digest(bytes) {
@@ -150,16 +152,16 @@ function validateVaultId(chainId, address, configuration) {
 async function validateInitialState(url, address, build, blockTag) {
   const zeroWord = "0".repeat(64);
   const storageSlots = {};
-  for (let slot = 0; slot <= 13; ++slot) {
+  for (let slot = 0; slot <= 14; ++slot) {
     const value = await rpc(url, "eth_getStorageAt", [address, `0x${slot.toString(16)}`, blockTag]);
     const normalized = storageWord(value);
-    const expected = slot === 13 ? `${"0".repeat(63)}1` : zeroWord;
+    const expected = slot === 14 ? `${"0".repeat(63)}1` : zeroWord;
     assertEqual(`initial storage slot ${slot}`, expected, normalized);
     storageSlots[slot] = `0x${normalized}`;
   }
 
   const finalizedState = await contractCall(url, address, build, "finalizedState()", "", blockTag);
-  for (let index = 0; index < 9; ++index) {
+  for (let index = 0; index < 10; ++index) {
     assertEqual(`initial finalizedState word ${index}`, zeroWord, word(finalizedState, index));
   }
   const zeroGetters = [
@@ -188,8 +190,8 @@ async function validateInitialState(url, address, build, blockTag) {
   return {
     blockTag,
     allProtocolStateZero: true,
-    reentrancyLockSlot13: "0x01",
-    rawStorageSlots0Through13: storageSlots
+    reentrancyLockSlot14: "0x01",
+    rawStorageSlots0Through14: storageSlots
   };
 }
 
@@ -224,10 +226,15 @@ function validateConstructorArguments(arguments_, configuration) {
 }
 
 async function main() {
-  const [rpcUrl, address, deploymentTransactionHash] = process.argv.slice(2);
-  if (!rpcUrl || !/^0x[0-9a-fA-F]{40}$/.test(address ?? "")) {
+  const [rpcUrl, address, deploymentTransactionHash, verifierPreflightPath] = process.argv.slice(2);
+  if (
+    !rpcUrl
+    || !/^0x[0-9a-fA-F]{40}$/.test(address ?? "")
+    || !/^0x[0-9a-fA-F]{64}$/.test(deploymentTransactionHash ?? "")
+    || !verifierPreflightPath
+  ) {
     throw new Error(
-      "Usage: node scripts/freeze-deployment.mjs <rpc-url> <vault-address> [deployment-transaction-hash]"
+      "Usage: node scripts/freeze-deployment.mjs <rpc-url> <vault-address> <deployment-transaction-hash> <verifier-preflight-json>"
     );
   }
 
@@ -243,19 +250,16 @@ async function main() {
 
   const chainId = await rpc(rpcUrl, "eth_chainId");
   const latest = await rpc(rpcUrl, "eth_getBlockByNumber", ["latest", false]);
-  let deploymentTransaction;
-  let deploymentReceipt;
-  if (deploymentTransactionHash) {
-    deploymentTransaction = await rpc(rpcUrl, "eth_getTransactionByHash", [deploymentTransactionHash]);
-    deploymentReceipt = await rpc(rpcUrl, "eth_getTransactionReceipt", [deploymentTransactionHash]);
-    if (!deploymentTransaction || !deploymentReceipt) throw new Error("Deployment transaction not found");
-    if (deploymentReceipt.status !== "0x1") throw new Error("Deployment transaction reverted");
-    if (deploymentReceipt.contractAddress?.toLowerCase() !== address.toLowerCase()) {
-      throw new Error("Deployment receipt contract address does not match vault address");
-    }
+  const deploymentTransaction = await rpc(rpcUrl, "eth_getTransactionByHash", [deploymentTransactionHash]);
+  const deploymentReceipt = await rpc(rpcUrl, "eth_getTransactionReceipt", [deploymentTransactionHash]);
+  if (!deploymentTransaction || !deploymentReceipt) throw new Error("Deployment transaction not found");
+  if (deploymentTransaction.to !== null) throw new Error("Deployment transaction is not a direct contract creation");
+  if (deploymentReceipt.status !== "0x1") throw new Error("Deployment transaction reverted");
+  if (deploymentReceipt.contractAddress?.toLowerCase() !== address.toLowerCase()) {
+    throw new Error("Deployment receipt contract address does not match vault address");
   }
 
-  const stateBlock = deploymentReceipt?.blockNumber ?? "latest";
+  const stateBlock = deploymentReceipt.blockNumber;
   const immutableConfiguration = await readImmutableConfiguration(rpcUrl, address, build, stateBlock);
   assertEqual("PROTOCOL_VERSION", "1", immutableConfiguration.protocolVersion);
   assertEqual("ACTIVE_LIABILITY_CAP_USDT6", "1000000000000000", immutableConfiguration.activeLiabilityCapUSDT6);
@@ -267,6 +271,17 @@ async function main() {
   const verifierRuntimeHex = await rpc(rpcUrl, "eth_getCode", [immutableConfiguration.proofVerifier, stateBlock]);
   if (!verifierRuntimeHex || verifierRuntimeHex === "0x") throw new Error("Immutable verifier has no code");
   const verifierRuntime = Buffer.from(verifierRuntimeHex.slice(2), "hex");
+  const verifierAnalysis = analyzeVerifierRuntime(verifierRuntime, manifest.blockedVerifierFingerprints ?? []);
+  const resolvedPreflightPath = path.resolve(verifierPreflightPath);
+  const verifierPreflightBytes = fs.readFileSync(resolvedPreflightPath);
+  const verifierPreflightEvidence = JSON.parse(verifierPreflightBytes);
+  const verifierPreflight = validatePreflightEvidence(
+    verifierRuntime,
+    verifierAnalysis,
+    verifierPreflightEvidence,
+    verifierPreflightBytes,
+    resolvedPreflightPath
+  );
   assertEqual(
     "PROOF_VERIFIER_CODEHASH",
     immutableConfiguration.proofVerifierCodehash,
@@ -318,29 +333,28 @@ async function main() {
       proofVerifier: {
         address: immutableConfiguration.proofVerifier,
         ...digest(verifierRuntime),
-        reportedIdentity: verifierReportedIdentity
+        reportedIdentity: verifierReportedIdentity,
+        preflight: verifierPreflight
       }
     },
     initialState
   };
 
-  if (deploymentTransactionHash) {
-    const input = Buffer.from(deploymentTransaction.input.slice(2), "hex");
-    const creationTemplate = build.creationBytecode.hex.slice(2).toLowerCase();
-    if (!deploymentTransaction.input.slice(2).toLowerCase().startsWith(creationTemplate)) {
-      throw new Error("Deployment initcode does not start with frozen creation-bytecode template");
-    }
-    const constructorArguments = decodeConstructorArguments(
-      deploymentTransaction.input.slice(2 + creationTemplate.length)
-    );
-    validateConstructorArguments(constructorArguments, immutableConfiguration);
-    frozen.deploymentTransaction = {
-      hash: deploymentTransactionHash.toLowerCase(),
-      inputBytes: input.length,
-      ...digest(input),
-      constructorArguments
-    };
+  const input = Buffer.from(deploymentTransaction.input.slice(2), "hex");
+  const creationTemplate = build.creationBytecode.hex.slice(2).toLowerCase();
+  if (!deploymentTransaction.input.slice(2).toLowerCase().startsWith(creationTemplate)) {
+    throw new Error("Deployment initcode does not start with frozen creation-bytecode template");
   }
+  const constructorArguments = decodeConstructorArguments(
+    deploymentTransaction.input.slice(2 + creationTemplate.length)
+  );
+  validateConstructorArguments(constructorArguments, immutableConfiguration);
+  frozen.deploymentTransaction = {
+    hash: deploymentTransactionHash.toLowerCase(),
+    inputBytes: input.length,
+    ...digest(input),
+    constructorArguments
+  };
 
   const outputDirectory = path.join(root, "artifacts", "deployments");
   fs.mkdirSync(outputDirectory, { recursive: true });

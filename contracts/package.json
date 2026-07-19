@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node scripts/build-manifest.mjs",
     "check:build": "node scripts/build-manifest.mjs --check",
-    "test": "node scripts/build-manifest.mjs --check && node test/run-tests.mjs"
+    "test": "node scripts/build-manifest.mjs --check && node --test test/verifier-preflight.test.mjs && node test/run-tests.mjs"
   },
   "devDependencies": {
     "@noble/hashes": "1.8.0",

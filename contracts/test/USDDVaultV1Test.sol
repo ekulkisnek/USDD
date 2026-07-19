@@ -206,9 +206,70 @@ contract USDDVaultV1Test {
         USDDVaultV1.ElementsBridgeState memory second = _state(2, 1, first.cumulativeBurnRoot, 102, 12, 202);
         (, bytes32 secondStatement) = f.vault.elementsStateStatement(second);
         f.vault.advanceElementsState(second, abi.encodePacked(secondStatement));
-        (uint64 sequence, uint64 burnCount,,,,,,,) = f.vault.finalizedState();
+        (uint64 sequence, uint64 burnCount,,,,,,,,) = f.vault.finalizedState();
         _eq(2, sequence);
         _eq(1, burnCount);
+    }
+
+    function testStateRequiresConsensusDigestCanonicalEmptyRootAndBoundedBurnGrowth() external {
+        Fixture memory digestFixture = _fixture();
+        USDDVaultV1.ElementsBridgeState memory zeroDigest =
+            _state(1, 1, bytes32(uint256(0x7007)), 101, 11, 201);
+        zeroDigest.elementsConsensusStateDigest = bytes32(0);
+        (, bytes32 zeroDigestStatement) = digestFixture.vault.elementsStateStatement(zeroDigest);
+        _expectRevert(
+            address(digestFixture.vault),
+            abi.encodeCall(
+                USDDVaultV1.advanceElementsState, (zeroDigest, abi.encodePacked(zeroDigestStatement))
+            )
+        );
+
+        Fixture memory emptyFixture = _fixture();
+        USDDVaultV1.ElementsBridgeState memory wrongEmptyRoot =
+            _state(1, 0, bytes32(uint256(0xBAD)), 101, 11, 201);
+        (, bytes32 wrongEmptyStatement) = emptyFixture.vault.elementsStateStatement(wrongEmptyRoot);
+        _expectRevert(
+            address(emptyFixture.vault),
+            abi.encodeCall(
+                USDDVaultV1.advanceElementsState, (wrongEmptyRoot, abi.encodePacked(wrongEmptyStatement))
+            )
+        );
+
+        USDDVaultV1.ElementsBridgeState memory canonicalEmpty =
+            _state(1, 0, emptyFixture.vault.EMPTY_BURN_ROOT(), 101, 11, 201);
+        (, bytes32 canonicalEmptyStatement) = emptyFixture.vault.elementsStateStatement(canonicalEmpty);
+        emptyFixture.vault.advanceElementsState(canonicalEmpty, abi.encodePacked(canonicalEmptyStatement));
+
+        USDDVaultV1.ElementsBridgeState memory repeatedConsensusState =
+            _state(2, 0, emptyFixture.vault.EMPTY_BURN_ROOT(), 102, 12, 202);
+        repeatedConsensusState.elementsConsensusStateDigest = canonicalEmpty.elementsConsensusStateDigest;
+        (, bytes32 repeatedConsensusStatement) =
+            emptyFixture.vault.elementsStateStatement(repeatedConsensusState);
+        _expectRevert(
+            address(emptyFixture.vault),
+            abi.encodeCall(
+                USDDVaultV1.advanceElementsState,
+                (repeatedConsensusState, abi.encodePacked(repeatedConsensusStatement))
+            )
+        );
+
+        USDDVaultV1.ElementsBridgeState memory excessiveGrowth =
+            _state(2, 65, bytes32(uint256(0x7008)), 102, 12, 202);
+        (, bytes32 excessiveGrowthStatement) = emptyFixture.vault.elementsStateStatement(excessiveGrowth);
+        _expectRevert(
+            address(emptyFixture.vault),
+            abi.encodeCall(
+                USDDVaultV1.advanceElementsState, (excessiveGrowth, abi.encodePacked(excessiveGrowthStatement))
+            )
+        );
+
+        Fixture memory boundaryFixture = _fixture();
+        USDDVaultV1.ElementsBridgeState memory maximumGrowth =
+            _state(1, 64, bytes32(uint256(0x7009)), 101, 11, 201);
+        (, bytes32 maximumGrowthStatement) = boundaryFixture.vault.elementsStateStatement(maximumGrowth);
+        boundaryFixture.vault.advanceElementsState(maximumGrowth, abi.encodePacked(maximumGrowthStatement));
+        (, uint64 burnCount,,,,,,,,) = boundaryFixture.vault.finalizedState();
+        _eq(64, burnCount);
     }
 
     function testConstructorRejectsVerifierIdentityMismatch() external {
@@ -378,6 +439,15 @@ contract USDDVaultV1Test {
             bytes4(0x55534444), uint8(1), f.vault.VAULT_ID(), address(0xBEEF), uint64(777_000)
         );
         _eq(sha256(expected), sha256(payload));
+
+        uint64 maximumBurn = f.vault.MAX_BURN_AMOUNT_USDT6();
+        _expectRevert(
+            address(f.vault),
+            abi.encodeCall(USDDVaultV1.encodeBurnPayload, (address(0xBEEF), maximumBurn + 1))
+        );
+        _expectRevert(
+            address(f.vault), abi.encodeCall(USDDVaultV1.encodeBurnPayload, (address(0), uint64(1)))
+        );
     }
 
     function testOneLeafAccumulatorConventionVector() external pure {
@@ -480,6 +550,7 @@ contract USDDVaultV1Test {
             sequence: sequence,
             burnCount: burnCount,
             elementsTipHash: bytes32(uint256(0x1111) + sequence),
+            elementsConsensusStateDigest: bytes32(uint256(0x1818) + sequence),
             cumulativeBurnRoot: burnRoot,
             finalizedBitcoinBlockHash: bytes32(uint256(0x2222) + sequence),
             bitcoinHeight: bitcoinHeight,
@@ -506,6 +577,7 @@ contract USDDVaultV1Test {
                 state_.sequence,
                 state_.burnCount,
                 state_.elementsTipHash,
+                state_.elementsConsensusStateDigest,
                 state_.cumulativeBurnRoot,
                 state_.finalizedBitcoinBlockHash,
                 state_.bitcoinHeight,

@@ -43,9 +43,18 @@ statement kind is `ETH_STATE_V1 = 1`. The verified journal commits:
 - the immutable `configHash` and pinned Ethereum guest program/VK;
 - the prior and next Ethereum light-client digests;
 - the prior and next finalized beacon slot/root and execution root;
+- the finalized execution-block timestamp proved by the Ethereum guest;
 - `count:u8` in the inclusive range 1..64;
 - exactly `count` Ethereum vault deposits in nonce order; and
 - the resulting `nextMintNonce` and `totalMinted`.
+
+The same journal is supplied to the controller as a fixed typed Simplicity
+witness value. The controller canonicalizes and SHA-256 hashes that value, then
+passes the digest and frozen Ethereum guest program ID to
+`verify_sp1_compressed_sha256`. That environmental jet reads the exact proof
+annex internally and returns true only when the annex carries the same public
+values and a valid raw-compressed proof. The controller never receives opaque
+proof bytes, and V1 has no generic annex-byte jet.
 
 The same statement also supports a state-only heartbeat, distinguished inside
 the strictly decoded journal. This is necessary because Ethereum light-client
@@ -58,6 +67,14 @@ its vault nonce, exact six-decimal `amountUSDT6`, and exact Elements recipient
 script commitment. The guest proves finalized Ethereum consensus, the execution
 state transition, the immutable vault code, exact USDT balance movement, and the
 vault's deposit record. Logs or RPC responses alone are not authorization.
+
+The Ethereum claim and typed public journal contain no BMM parent MTP. Ethereum
+consensus cannot authenticate an Elements/Bitcoin block-context value. The
+controller reads `current_bmm_parent_mtp` only from the Elements environment jet
+and requires
+`abs(current_bmm_parent_mtp - journal.executionBlockTimestamp) <= 21600`.
+Both subtraction directions must use checked unsigned arithmetic. A prover- or
+host-supplied value labelled as BMM MTP is noncanonical and must be rejected.
 
 For a current `nextMintNonce = N`, valid nonces are exactly
 `N, N+1, ..., N+count-1`. No sorting, skipping, duplicate, range proof, or
@@ -74,24 +91,37 @@ of the following in one transaction:
 3. the current state equals the journal's prior controller/light-client state;
 4. the envelope is canonical, at most 512 KiB, SHA-256-bound, and uses the one
    pinned Ethereum-state guest VK;
-5. the batch contains 1..64 exact consecutive nonces starting at
+5. authenticated `current_bmm_parent_mtp` is present and differs from the
+   journal's Ethereum-proved execution timestamp by no more than 21,600 seconds;
+6. the batch contains 1..64 exact consecutive nonces starting at
    `nextMintNonce`;
-6. for every deposit, mint amount is `amountUSDT6 * 100`, positive and within
-   `u64`; the batch sum is also within `u64`;
-7. native USDD reissuance equals exactly that batch sum and pays each amount to
+7. for every deposit, mint amount is `amountUSDT6 * 100`, positive, no greater
+   than 20,000,000 USDT, and within `u64`; the batch sum is also no greater
+   than 20,000,000 USDT / 2,000,000,000,000,000 USDD base units, retaining
+   100,000,000,000,000 explicit-value units below Elements' transaction-wide
+   `MAX_MONEY` sum;
+8. native USDD reissuance equals exactly that batch sum and pays each amount to
    its proved Elements recipient (deterministically coalescing identical
    recipients only if the frozen transaction template explicitly permits it);
-8. `sequence' = sequence + 1` and
+9. `sequence' = sequence + 1` and
    `nextMintNonce' = nextMintNonce + count`;
-9. `totalMinted' = totalMinted + batchUSDD8`;
-10. the successor uses the journal's next light-client digest, beacon
+10. `totalMinted' = totalMinted + batchUSDD8`;
+11. the successor uses the journal's next light-client digest, beacon
     slot/root, and execution root, with unchanged version/config hash;
-11. exactly one successor controller output exists; and
-12. every reissuance-token unit returns to that exact successor, with no USDD or
+12. exactly one successor controller output exists; and
+13. every reissuance-token unit returns to that exact successor, with no USDD or
     token inflation elsewhere.
 
 Parsing success cannot satisfy item 4. The current Elements scaffold returns
 `SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE` even for a canonical proof envelope.
+
+`usdd_formats.validate_controller_transaction` is the executable differential
+model for items 1, 2, 7, 8, 12, and 13. It fixes input zero as the one
+token-bearing controller, output zero as the one token-bearing successor,
+allows reissuance only on that input, requires ordered explicit USDD outputs,
+and rejects every confidential asset input/output because such a commitment
+could conceal USDD or the authority token. It is a test oracle, not a covenant;
+the compiled Simplicity program must reproduce all of its rejection cases.
 
 ## Permissionless heartbeat transaction
 
@@ -104,9 +134,11 @@ deposit batch. It must enforce all of the following:
 4. unchanged version and `configHash`;
 5. a strictly newer proved finalized beacon slot and its exact root, execution
    root, and Ethereum light-client digest;
-6. zero asset issuance or reissuance in every input;
-7. zero USDD recipient outputs and zero reissuance-token leakage; and
-8. the reissuance token returns unchanged to the one successor.
+6. authenticated `current_bmm_parent_mtp` differs from the journal's
+   Ethereum-proved execution timestamp by no more than 21,600 seconds;
+7. zero asset issuance or reissuance in every input;
+8. zero USDD recipient outputs and zero reissuance-token leakage; and
+9. the reissuance token returns unchanged to the one successor.
 
 Anyone may submit a heartbeat. Strictly newer finalized state prevents replayed
 heartbeats from endlessly bumping the sequence and front-running a mint. A
@@ -125,8 +157,10 @@ asset        = configured native USDD asset (explicit)
 value        = amountUSDT6 * 100 USDD8 (explicit)
 ```
 
-Version is 1; vault ID and recipient are nonzero; amount is positive; and the
-multiply must fit `u64`. The 65-byte data push is minimally encoded by `0x41`.
+Version is 1; vault ID and recipient are nonzero; amount is positive and no
+greater than 20,000,000 USDT; and the multiply must fit `u64`. The 65-byte data
+push is minimally encoded by `0x41`. Larger redemptions use multiple burns so
+each burn transaction retains explicit fee headroom.
 No arbitrary intent nonce, rail tag, Tron address, or config blob is present.
 
 The canonical burn identity is:
@@ -172,11 +206,14 @@ mint controller.
 - counts 0, 1, 64, and 65; gaps, duplicates, reordering, wrong first nonce;
 - heartbeat with issuance, USDD output, changed nonce/total/config, unchanged or
   decreasing finalized slot, and replayed light-client state;
-- every `u64` multiplication/sum/sequence/nonce overflow boundary;
+- every `u64` multiplication/sum/sequence/nonce overflow boundary and exact
+  20,000,000-USDT batch / Elements explicit-output-total boundary;
 - wrong config, guest VK, chain, vault, token, light-client root, recipient,
   issuance asset, reissuance token, controller CMR, and successor count;
 - raw-annex hash mismatch, truncation, trailing bytes, and 512 KiB boundary;
-- absent/different authenticated BMM parent context and script-cache isolation;
+- absent/different authenticated BMM parent context, exact 21,600/21,601-second
+  boundaries in both subtraction directions, forbidden caller-supplied MTP
+  fields, and script-cache isolation;
 - burn script nonminimal push, confidential asset/value, value mismatch,
   sub-micro dust, wrong outpoint/vault/recipient, and replay;
 - invalid Elements block with a valid-looking BMM commitment; and

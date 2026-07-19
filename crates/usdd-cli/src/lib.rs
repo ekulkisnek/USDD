@@ -1,9 +1,10 @@
 use std::{fs, path::Path, str::FromStr};
 
 use usdd_core::{
-    decode_hex, encode_hex, merkle_leaf, merkle_proof, merkle_root, usdd_base_to_usdt_micro,
-    usdt_micro_to_usdd_base, AuditSnapshot, Burn, BurnAccumulator, BurnProof, CanonicalDecode,
-    CanonicalEncode, Deposit, GateReport, Hash32, MerkleProof, Mint, MintBatch, ProtocolManifest,
+    decode_hex, encode_hex, merkle_leaf, merkle_proof, merkle_root, reconstruct_audit_snapshot,
+    usdd_base_to_usdt_micro, usdt_micro_to_usdd_base, AuditSnapshot, AuditedBurn, AuditedDeposit,
+    AuditedMint, AuditedPayout, Burn, BurnAccumulator, BurnProof, CanonicalDecode, CanonicalEncode,
+    Deposit, EthAddress, GateReport, Hash32, MerkleProof, Mint, MintBatch, ProtocolManifest,
 };
 use usdd_proof_core::StrictJournal;
 
@@ -31,6 +32,7 @@ merkle root <leaf-data-hex>...
 merkle prove <index> <leaf-data-hex>...
 merkle verify <root-hash> <leaf-data-hex> <proof-hex>
 audit check <actual> <recorded> <deposited> <paid> <minted> <burned> <unminted> <unpaid>
+audit replay <actual> <recorded> <chain-events.tsv>
 journal inspect <journal-hex>
 gates report [launch-gates.tsv]
 ";
@@ -240,6 +242,34 @@ pub fn run_str(args: &[&str]) -> Result<String, String> {
                 report.circulating_usdd_base
             ))
         }
+        ["audit", "replay", actual, recorded, path] => {
+            let actual = parse_u64(actual, "actual vault balance")?;
+            let recorded = parse_u64(recorded, "recorded backing")?;
+            let contents = fs::read_to_string(path)
+                .map_err(|error| format!("cannot read audit events at {path}: {error}"))?;
+            let events = parse_audit_events(&contents)?;
+            let (snapshot, report) = reconstruct_audit_snapshot(
+                actual,
+                recorded,
+                &events.deposits,
+                &events.mints,
+                &events.burns,
+                &events.payouts,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "PASS (chain-event input must be independently authenticated)\ndeposits={}\nmints={}\nburns={}\npayouts={}\nexpected_backing_usdt_micro={}\nphysical_surplus_usdt_micro={}\ncirculating_usdd_base={}\nunminted_usdt_micro={}\nunpaid_burns_usdt_micro={}",
+                events.deposits.len(),
+                events.mints.len(),
+                events.burns.len(),
+                events.payouts.len(),
+                report.expected_backing_usdt_micro,
+                report.physical_surplus_usdt_micro,
+                report.circulating_usdd_base,
+                snapshot.deposits_unminted_usdt_micro,
+                snapshot.burns_unpaid_usdt_micro,
+            ))
+        }
         ["journal", "inspect", encoded] => {
             let bytes = decode_hex(encoded).map_err(|error| error.to_string())?;
             let journal = StrictJournal::decode_strict(&bytes).map_err(|error| error.to_string())?;
@@ -282,6 +312,89 @@ fn parse_hashes(values: &[&str], name: &str) -> Result<Vec<Hash32>, String> {
         .iter()
         .map(|value| Hash32::from_str(value).map_err(|error| format!("invalid {name}: {error}")))
         .collect()
+}
+
+#[derive(Default)]
+struct AuditEvents {
+    deposits: Vec<AuditedDeposit>,
+    mints: Vec<AuditedMint>,
+    burns: Vec<AuditedBurn>,
+    payouts: Vec<AuditedPayout>,
+}
+
+fn parse_audit_events(input: &str) -> Result<AuditEvents, String> {
+    let mut lines = input.lines();
+    if lines.next() != Some("kind\tindex\tid\tamount\trecipient") {
+        return Err("invalid audit TSV header".to_owned());
+    }
+    let mut events = AuditEvents::default();
+    for (offset, line) in lines.enumerate() {
+        let line_number = offset + 2;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() != 5 {
+            return Err(format!("audit TSV line {line_number} must have 5 columns"));
+        }
+        let id = Hash32::from_str(fields[2])
+            .map_err(|error| format!("audit TSV line {line_number} has invalid ID: {error}"))?;
+        let amount = parse_u64(fields[3], "audit amount")?;
+        match fields[0] {
+            "deposit" => {
+                if fields[4] != "-" {
+                    return Err(format!(
+                        "audit TSV line {line_number} deposit recipient must be -"
+                    ));
+                }
+                events.deposits.push(AuditedDeposit {
+                    nonce: parse_u64(fields[1], "deposit nonce")?,
+                    deposit_id: id,
+                    amount_usdt_micro: amount,
+                });
+            }
+            "mint" => {
+                if fields[4] != "-" {
+                    return Err(format!(
+                        "audit TSV line {line_number} mint recipient must be -"
+                    ));
+                }
+                events.mints.push(AuditedMint {
+                    nonce: parse_u64(fields[1], "mint nonce")?,
+                    deposit_id: id,
+                    amount_usdd_base: amount,
+                });
+            }
+            "burn" => events.burns.push(AuditedBurn {
+                burn_index: parse_u64(fields[1], "burn index")?,
+                burn_id: id,
+                amount_usdd_base: amount,
+                recipient: EthAddress::from_str(fields[4]).map_err(|error| {
+                    format!("audit TSV line {line_number} has invalid recipient: {error}")
+                })?,
+            }),
+            "payout" => {
+                if fields[1] != "-" {
+                    return Err(format!(
+                        "audit TSV line {line_number} payout index must be -"
+                    ));
+                }
+                events.payouts.push(AuditedPayout {
+                    burn_id: id,
+                    amount_usdt_micro: amount,
+                    recipient: EthAddress::from_str(fields[4]).map_err(|error| {
+                        format!("audit TSV line {line_number} has invalid recipient: {error}")
+                    })?,
+                });
+            }
+            kind => {
+                return Err(format!(
+                    "audit TSV line {line_number} has unknown kind {kind}"
+                ))
+            }
+        }
+    }
+    Ok(events)
 }
 
 fn gate_report(path: &str) -> Result<String, String> {
@@ -363,6 +476,30 @@ mod tests {
             run_str(&["merkle", "verify", root, "01", proof]).unwrap(),
             "VALID"
         );
+    }
+
+    #[test]
+    fn audit_replay_reconstructs_and_rejects_duplicate_payouts() {
+        let recipient = "0505050505050505050505050505050505050505";
+        let deposit_id = "01".repeat(32);
+        let burn_id = "02".repeat(32);
+        let valid = format!(
+            "kind\tindex\tid\tamount\trecipient\n\
+             deposit\t0\t{deposit_id}\t10\t-\n\
+             mint\t0\t{deposit_id}\t1000\t-\n\
+             burn\t0\t{burn_id}\t400\t{recipient}\n\
+             payout\t-\t{burn_id}\t4\t{recipient}\n"
+        );
+        let path = std::env::temp_dir().join(format!("usdd-audit-{}.tsv", std::process::id()));
+        std::fs::write(&path, &valid).unwrap();
+        let output = run_str(&["audit", "replay", "6", "6", path.to_str().unwrap()]).unwrap();
+        assert!(output.starts_with("PASS"));
+        assert!(output.contains("circulating_usdd_base=600"));
+
+        let duplicate = format!("{valid}payout\t-\t{burn_id}\t4\t{recipient}\n");
+        std::fs::write(&path, duplicate).unwrap();
+        assert!(run_str(&["audit", "replay", "2", "2", path.to_str().unwrap(),]).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

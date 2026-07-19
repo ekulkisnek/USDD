@@ -27,7 +27,7 @@ contract USDTHTLC {
     address public immutable REFUND_RECIPIENT;
     uint256 public immutable AMOUNT;
     bytes32 public immutable SECRET_HASH;
-    uint64 public immutable ELEMENTS_REFUND_TIMESTAMP;
+    uint32 public immutable ELEMENTS_REFUND_TIMESTAMP;
     uint64 public immutable REFUND_TIMESTAMP;
 
     State public state;
@@ -35,13 +35,15 @@ contract USDTHTLC {
 
     error ZeroAddress();
     error AddressHasNoCode(address target);
+    error EndpointIsEscrow(address endpoint);
+    error IdenticalRecipients(address recipient);
     error ZeroAmount();
     error InvalidSecretHash();
-    error InvalidElementsRefundTimestamp(uint64 supplied, uint256 currentTime);
+    error InvalidElementsRefundTimestamp(uint32 supplied, uint256 currentTime);
     error InvalidRefundTimestamp(uint64 supplied, uint256 currentTime);
-    error UnsafeRefundOrder(uint64 elementsRefundTimestamp, uint64 externalRefundTimestamp, uint64 minimumGap);
+    error UnsafeRefundOrder(uint32 elementsRefundTimestamp, uint64 externalRefundTimestamp, uint64 minimumGap);
     error InvalidState(State expected, State actual);
-    error FundingWindowClosed(uint256 currentTime, uint64 refundTimestamp);
+    error FundingWindowClosed(uint256 currentTime, uint32 refundTimestamp);
     error ClaimWindowClosed(uint256 currentTime, uint64 refundTimestamp);
     error RefundNotAvailable(uint256 currentTime, uint64 refundTimestamp);
     error InvalidSecret();
@@ -59,23 +61,24 @@ contract USDTHTLC {
         address refundRecipient,
         uint256 amount,
         bytes32 secretHash,
-        uint64 elementsRefundTimestamp,
+        uint32 elementsRefundTimestamp,
         uint64 refundTimestamp
     ) {
         if (usdt == address(0) || funder == address(0) || claimRecipient == address(0) || refundRecipient == address(0)) {
             revert ZeroAddress();
         }
         if (usdt.code.length == 0) revert AddressHasNoCode(usdt);
+        if (funder == address(this)) revert EndpointIsEscrow(funder);
+        if (claimRecipient == address(this)) revert EndpointIsEscrow(claimRecipient);
+        if (refundRecipient == address(this)) revert EndpointIsEscrow(refundRecipient);
+        if (claimRecipient == refundRecipient) revert IdenticalRecipients(claimRecipient);
         if (amount == 0) revert ZeroAmount();
         if (secretHash == bytes32(0)) revert InvalidSecretHash();
         if (elementsRefundTimestamp <= block.timestamp) {
             revert InvalidElementsRefundTimestamp(elementsRefundTimestamp, block.timestamp);
         }
         if (refundTimestamp <= block.timestamp) revert InvalidRefundTimestamp(refundTimestamp, block.timestamp);
-        if (
-            elementsRefundTimestamp > type(uint64).max - MINIMUM_REFUND_GAP
-                || refundTimestamp < elementsRefundTimestamp + MINIMUM_REFUND_GAP
-        ) {
+        if (refundTimestamp < uint64(elementsRefundTimestamp) + MINIMUM_REFUND_GAP) {
             revert UnsafeRefundOrder(elementsRefundTimestamp, refundTimestamp, MINIMUM_REFUND_GAP);
         }
 

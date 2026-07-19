@@ -1,5 +1,5 @@
 ordinal	field	type	requirement
-1	schema	u16	1
+1	schema	u16	2
 2	type_tag	u16	0x4001
 3	ethereum_chain_id	u64	nonzero
 4	ethereum_genesis	bytes32	nonzero
@@ -15,7 +15,7 @@ ordinal	field	type	requirement
 14	vault_code_hash	bytes32	nonzero
 15	proof_verifier	bytes20	nonzero
 16	proof_verifier_runtime_code_hash	bytes32	nonzero
-17	verifier_config_hash	bytes32	nonzero
+17	verifier_config_hash	bytes32	derived USDD/1/outbound-verifier-config projection
 18	ethereum_guest_program_id	bytes32	nonzero
 19	elements_guest_program_id	bytes32	nonzero
 20	sp1_version_major	u16	6

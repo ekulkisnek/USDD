@@ -7,11 +7,12 @@ use crate::{
     hash::{Domain, Hash32},
     hash_bytes,
     types::{EthAddress, MintControllerState},
-    ACTIVE_LIABILITY_CAP_USDT_MICRO, DRIVECHAIN_SLOT, ENCODING_SCHEMA,
-    MAX_ETHEREUM_FINALITY_SLOT_GAP, MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS,
-    MINIMUM_BITCOIN_CONFIRMATIONS, SHA256_DIGEST_TAG, SP1_COMPRESSED_CIRCUIT_VERSION,
-    SP1_COMPRESSED_CODEC_VERSION, SP1_GIT_COMMIT, SP1_VERSION_MAJOR, SP1_VERSION_MINOR,
-    SP1_VERSION_PATCH, USDD_SCALE, USDD_UNITS_PER_USDT_MICRO, USDT_SCALE,
+    ACTIVE_LIABILITY_CAP_USDT_MICRO, BURN_ACCUMULATOR_DEPTH, DRIVECHAIN_SLOT, ENCODING_SCHEMA,
+    MAX_BURN_APPENDS_PER_STATE_TRANSITION, MAX_ETHEREUM_FINALITY_SLOT_GAP,
+    MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS, MINIMUM_BITCOIN_CONFIRMATIONS, SHA256_DIGEST_TAG,
+    SP1_COMPRESSED_CIRCUIT_VERSION, SP1_COMPRESSED_CODEC_VERSION, SP1_GIT_COMMIT,
+    SP1_VERSION_MAJOR, SP1_VERSION_MINOR, SP1_VERSION_PATCH, USDD_SCALE, USDD_UNITS_PER_USDT_MICRO,
+    USDT_SCALE,
 };
 
 const TAG_MANIFEST: u16 = 0x4001;
@@ -80,6 +81,7 @@ pub enum ManifestError {
     WrongSp1Identity,
     WrongDomainSeparatorTable,
     WrongControllerConfiguration,
+    WrongOutboundVerifierConfiguration,
     WrongFinalityThresholds,
     WrongVaultId,
     WrongLiabilityCap,
@@ -107,6 +109,9 @@ impl fmt::Display for ManifestError {
             }
             Self::WrongControllerConfiguration => {
                 f.write_str("controller configuration hash does not match the non-circular V1 projection")
+            }
+            Self::WrongOutboundVerifierConfiguration => {
+                f.write_str("outbound verifier configuration hash does not match the non-circular V1 projection")
             }
             Self::WrongFinalityThresholds => f.write_str(
                 "V1 requires max 4096 Ethereum slots, max 6h finalized-state age, and at least 100 Bitcoin confirmations",
@@ -236,6 +241,9 @@ impl ProtocolManifest {
         if self.controller_configuration_hash != self.compute_controller_configuration_hash() {
             return Err(ManifestError::WrongControllerConfiguration);
         }
+        if self.verifier_config_hash != self.compute_outbound_verifier_config_hash() {
+            return Err(ManifestError::WrongOutboundVerifierConfiguration);
+        }
         if self.active_liability_cap_usdt_micro != ACTIVE_LIABILITY_CAP_USDT_MICRO {
             return Err(ManifestError::WrongLiabilityCap);
         }
@@ -314,6 +322,43 @@ impl ProtocolManifest {
         self.usdd_display_decimals.encode_to(&mut payload);
         self.usdd_units_per_usdt_micro.encode_to(&mut payload);
         domain_hash(Domain::ControllerConfig, &payload)
+    }
+
+    /// Commit every non-circular security parameter used by the outbound
+    /// Elements/Bitcoin validity verifier. The verifier runtime identity is
+    /// pinned separately by the vault and is deliberately omitted here: a
+    /// runtime containing this hash as a literal would otherwise be circular.
+    pub fn compute_outbound_verifier_config_hash(&self) -> Hash32 {
+        let mut payload = Vec::with_capacity(340);
+        ENCODING_SCHEMA.encode_to(&mut payload);
+        self.ethereum_chain_id.encode_to(&mut payload);
+        self.bitcoin_genesis.encode_to(&mut payload);
+        self.elements_genesis.encode_to(&mut payload);
+        self.drivechain_slot.encode_to(&mut payload);
+        self.vault.encode_to(&mut payload);
+        self.usdd_asset.encode_to(&mut payload);
+        self.elements_guest_program_id.encode_to(&mut payload);
+        self.sp1_version_major.encode_to(&mut payload);
+        self.sp1_version_minor.encode_to(&mut payload);
+        self.sp1_version_patch.encode_to(&mut payload);
+        self.sp1_git_commit.encode_to(&mut payload);
+        self.compressed_proof_circuit_version
+            .encode_to(&mut payload);
+        self.compressed_proof_codec_version.encode_to(&mut payload);
+        self.recursion_verifier_constants_hash
+            .encode_to(&mut payload);
+        self.public_digest_tag.encode_to(&mut payload);
+        self.domain_separator_table_hash.encode_to(&mut payload);
+        self.minimum_activation_chainwork.encode_to(&mut payload);
+        self.minimum_bitcoin_confirmations.encode_to(&mut payload);
+        // Frozen V1 burn accumulator depth and maximum appends per transition.
+        u8::try_from(BURN_ACCUMULATOR_DEPTH)
+            .expect("V1 burn depth fits u8")
+            .encode_to(&mut payload);
+        u8::try_from(MAX_BURN_APPENDS_PER_STATE_TRANSITION)
+            .expect("V1 append bound fits u8")
+            .encode_to(&mut payload);
+        domain_hash(Domain::OutboundVerifierConfig, &payload)
     }
 
     pub fn compute_initial_controller_state_hash(&self) -> Hash32 {
@@ -499,6 +544,7 @@ mod tests {
             usdd_display_decimals: 8,
             usdd_units_per_usdt_micro: 100,
         };
+        manifest.verifier_config_hash = manifest.compute_outbound_verifier_config_hash();
         manifest.controller_configuration_hash = manifest.compute_controller_configuration_hash();
         manifest.vault_id = manifest.compute_vault_id();
         manifest.initial_controller_state_hash = manifest.compute_initial_controller_state_hash();
@@ -538,6 +584,48 @@ mod tests {
             changed.validate(),
             Err(ManifestError::WrongControllerConfiguration)
         ));
+    }
+
+    #[test]
+    fn outbound_configuration_binds_network_and_finality_policy() {
+        let manifest = valid_manifest();
+        assert_eq!(
+            manifest.verifier_config_hash,
+            manifest.compute_outbound_verifier_config_hash()
+        );
+
+        for mut changed in [
+            {
+                let mut value = manifest.clone();
+                value.bitcoin_genesis = hash(90);
+                value
+            },
+            {
+                let mut value = manifest.clone();
+                value.elements_genesis = hash(91);
+                value
+            },
+            {
+                let mut value = manifest.clone();
+                value.minimum_bitcoin_confirmations += 1;
+                value
+            },
+            {
+                let mut value = manifest.clone();
+                value.minimum_activation_chainwork = hash(92);
+                value
+            },
+        ] {
+            // Recompute downstream identities, but deliberately retain the
+            // original outbound verifier configuration commitment.
+            changed.controller_configuration_hash = changed.compute_controller_configuration_hash();
+            changed.vault_id = changed.compute_vault_id();
+            changed.initial_controller_state_hash = changed.compute_initial_controller_state_hash();
+            assert!(matches!(
+                changed.validate(),
+                Err(ManifestError::WrongOutboundVerifierConfiguration)
+            ));
+        }
     }
 
     #[test]

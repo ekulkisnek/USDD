@@ -1,7 +1,11 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use usdd_core::{hash_bytes, CanonicalEncode, DecodeError, Decoder, Hash32, ENCODING_SCHEMA};
+use usdd_core::{
+    hash_bytes, CanonicalDecode, CanonicalEncode, DecodeError, Decoder, Hash32, ENCODING_SCHEMA,
+};
+
+use crate::claims::{DepositPublicOutput, ElementsStatePublicOutput, HeartbeatPublicOutput};
 
 pub const JOURNAL_MAGIC: [u8; 8] = *b"USDDJNL1";
 pub const JOURNAL_SUCCESS_MARKER: [u8; 8] = *b"SUCCESS!";
@@ -16,14 +20,14 @@ pub enum DigestAlgorithm {
 #[repr(u8)]
 pub enum StatementKind {
     EthereumState = 1,
-    ElementsBurn = 2,
+    ElementsState = 2,
 }
 
 impl StatementKind {
     fn decode(tag: u8) -> Result<Self, JournalError> {
         match tag {
             1 => Ok(Self::EthereumState),
-            2 => Ok(Self::ElementsBurn),
+            2 => Ok(Self::ElementsState),
             _ => Err(JournalError::UnsupportedStatementKind(tag)),
         }
     }
@@ -43,6 +47,33 @@ pub struct StrictJournal {
     payload: Vec<u8>,
 }
 
+/// The only public-value records authorized by V1 proof journals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedPublicValues {
+    Deposit(DepositPublicOutput),
+    Heartbeat(HeartbeatPublicOutput),
+    ElementsState(ElementsStatePublicOutput),
+}
+
+impl TypedPublicValues {
+    fn decode(statement_kind: StatementKind, payload: &[u8]) -> Result<Self, JournalError> {
+        match statement_kind {
+            StatementKind::EthereumState => {
+                if let Ok(value) = DepositPublicOutput::decode_exact(payload) {
+                    return Ok(Self::Deposit(value));
+                }
+                if let Ok(value) = HeartbeatPublicOutput::decode_exact(payload) {
+                    return Ok(Self::Heartbeat(value));
+                }
+                Err(JournalError::InvalidPayloadForStatement)
+            }
+            StatementKind::ElementsState => ElementsStatePublicOutput::decode_exact(payload)
+                .map(Self::ElementsState)
+                .map_err(|_| JournalError::InvalidPayloadForStatement),
+        }
+    }
+}
+
 impl StrictJournal {
     pub fn new(
         statement_kind: StatementKind,
@@ -55,6 +86,7 @@ impl StrictJournal {
         if payload.is_empty() {
             return Err(JournalError::EmptyPayload);
         }
+        TypedPublicValues::decode(statement_kind, &payload)?;
         Ok(Self {
             statement_kind,
             program_id,
@@ -95,6 +127,7 @@ impl StrictJournal {
         if hash_bytes(&payload) != payload_sha256 {
             return Err(JournalError::PayloadDigestMismatch);
         }
+        TypedPublicValues::decode(statement_kind, &payload)?;
         let value = Self {
             statement_kind,
             program_id,
@@ -121,6 +154,11 @@ impl StrictJournal {
 
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    pub fn typed_payload(&self) -> TypedPublicValues {
+        TypedPublicValues::decode(self.statement_kind, &self.payload)
+            .expect("StrictJournal constructors validate typed public values")
     }
 
     pub fn verify_expected(
@@ -167,6 +205,7 @@ pub enum JournalError {
     NonCanonicalEncoding,
     WrongProgramId,
     WrongStatementKind,
+    InvalidPayloadForStatement,
 }
 
 impl From<DecodeError> for JournalError {
@@ -198,6 +237,9 @@ impl fmt::Display for JournalError {
             Self::NonCanonicalEncoding => f.write_str("journal encoding is noncanonical"),
             Self::WrongProgramId => f.write_str("journal program ID does not match manifest"),
             Self::WrongStatementKind => f.write_str("journal statement kind is wrong"),
+            Self::InvalidPayloadForStatement => {
+                f.write_str("journal payload is not a canonical record for its statement kind")
+            }
         }
     }
 }
@@ -208,11 +250,49 @@ impl std::error::Error for JournalError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use usdd_core::MintControllerState;
+
+    fn heartbeat_payload() -> Vec<u8> {
+        let prior_state = MintControllerState {
+            version: 1,
+            sequence: 0,
+            next_mint_nonce: 0,
+            ethereum_light_client_digest: Hash32([1; 32]),
+            finalized_beacon_slot: 1,
+            finalized_beacon_root: Hash32([2; 32]),
+            finalized_execution_state_root: Hash32([3; 32]),
+            total_minted_usdd_base: 0,
+            configuration_hash: Hash32([4; 32]),
+        };
+        let next_state = MintControllerState {
+            version: 1,
+            sequence: 1,
+            next_mint_nonce: 0,
+            ethereum_light_client_digest: Hash32([5; 32]),
+            finalized_beacon_slot: 2,
+            finalized_beacon_root: Hash32([6; 32]),
+            finalized_execution_state_root: Hash32([7; 32]),
+            total_minted_usdd_base: 0,
+            configuration_hash: Hash32([4; 32]),
+        };
+        HeartbeatPublicOutput {
+            manifest_id: Hash32([8; 32]),
+            claim_id: Hash32([9; 32]),
+            prior_state,
+            next_state,
+            finalized_execution_block_timestamp: 1_700_000_000,
+        }
+        .encode()
+    }
 
     fn encoded() -> Vec<u8> {
-        StrictJournal::new(StatementKind::EthereumState, Hash32([7; 32]), vec![1, 2, 3])
-            .unwrap()
-            .encode()
+        StrictJournal::new(
+            StatementKind::EthereumState,
+            Hash32([7; 32]),
+            heartbeat_payload(),
+        )
+        .unwrap()
+        .encode()
     }
 
     #[test]
@@ -221,7 +301,10 @@ mod tests {
         let journal =
             StrictJournal::verify_expected(&bytes, Hash32([7; 32]), StatementKind::EthereumState)
                 .unwrap();
-        assert_eq!(journal.payload(), [1, 2, 3]);
+        assert!(matches!(
+            journal.typed_payload(),
+            TypedPublicValues::Heartbeat(_)
+        ));
     }
 
     #[test]
@@ -269,8 +352,27 @@ mod tests {
             Err(JournalError::WrongProgramId)
         );
         assert_eq!(
-            StrictJournal::verify_expected(&bytes, Hash32([7; 32]), StatementKind::ElementsBurn),
+            StrictJournal::verify_expected(&bytes, Hash32([7; 32]), StatementKind::ElementsState),
             Err(JournalError::WrongStatementKind)
+        );
+    }
+
+    #[test]
+    fn arbitrary_and_trailing_payload_records_are_rejected() {
+        assert_eq!(
+            StrictJournal::new(
+                StatementKind::EthereumState,
+                Hash32([7; 32]),
+                vec![1, 2, 3, 4],
+            ),
+            Err(JournalError::InvalidPayloadForStatement)
+        );
+
+        let mut trailing = heartbeat_payload();
+        trailing.push(0);
+        assert_eq!(
+            StrictJournal::new(StatementKind::EthereumState, Hash32([7; 32]), trailing),
+            Err(JournalError::InvalidPayloadForStatement)
         );
     }
 }

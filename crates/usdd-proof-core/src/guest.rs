@@ -1,15 +1,13 @@
 use core::fmt;
 
 use usdd_core::{
-    burn_accumulator_empty, hash_bytes, CanonicalEncode, ElementsEventKind, Hash32, MintBatch,
-    ProtocolManifest,
+    burn_accumulator_empty, hash_bytes, CanonicalEncode, Hash32, MintBatch, ProtocolManifest,
 };
 
 use crate::{
     claims::{
-        DepositPublicOutput, ElementsBurnClaim, ElementsStatePublicOutput,
-        ElementsStateTransitionClaim, EthereumDepositClaim, EthereumHeartbeatClaim,
-        HeartbeatPublicOutput, RedemptionPublicOutput,
+        DepositPublicOutput, ElementsStatePublicOutput, ElementsStateTransitionClaim,
+        EthereumDepositClaim, EthereumHeartbeatClaim, HeartbeatPublicOutput,
     },
     journal::{JournalError, StatementKind, StrictJournal},
 };
@@ -45,13 +43,6 @@ pub trait EthereumStateProofVerifier {
 /// commitment or transaction inclusion branch alone is not a validity proof.
 pub trait ElementsValidityProofVerifier {
     type Proof;
-
-    fn verify_canonical_burn(
-        &self,
-        manifest: &ProtocolManifest,
-        claim: &ElementsBurnClaim,
-        proof: &Self::Proof,
-    ) -> Result<(), VerificationError>;
 
     fn verify_elements_state_transition(
         &self,
@@ -107,11 +98,7 @@ pub fn build_deposit_journal<V: EthereumStateProofVerifier>(
     }
     let next_state = claim
         .prior_state
-        .apply_mint_batch(
-            &mint_batch,
-            &claim.finality,
-            claim.authenticated_bmm_parent_mtp,
-        )
+        .apply_mint_batch(&mint_batch, &claim.finality)
         .map_err(|_| GuestError::InvalidControllerTransition)?;
 
     verifier
@@ -123,6 +110,7 @@ pub fn build_deposit_journal<V: EthereumStateProofVerifier>(
         claim_id: claim.claim_id(),
         prior_state: claim.prior_state.clone(),
         next_state,
+        finalized_execution_block_timestamp: claim.finality.execution_block_timestamp,
         mint_batch,
     };
     StrictJournal::new(
@@ -153,7 +141,7 @@ pub fn build_heartbeat_journal<V: EthereumStateProofVerifier>(
     }
     let next_state = claim
         .prior_state
-        .apply_heartbeat(&claim.finality, claim.authenticated_bmm_parent_mtp)
+        .apply_heartbeat(&claim.finality)
         .map_err(|_| GuestError::InvalidControllerTransition)?;
     verifier
         .verify_finalized_heartbeat(manifest, claim, proof)
@@ -163,64 +151,11 @@ pub fn build_heartbeat_journal<V: EthereumStateProofVerifier>(
         claim_id: claim.claim_id(),
         prior_state: claim.prior_state.clone(),
         next_state,
+        finalized_execution_block_timestamp: claim.finality.execution_block_timestamp,
     };
     StrictJournal::new(
         StatementKind::EthereumState,
         manifest.ethereum_guest_program_id,
-        output.encode(),
-    )
-    .map_err(GuestError::Journal)
-}
-
-pub fn build_redemption_journal<V: ElementsValidityProofVerifier>(
-    verifier: &V,
-    manifest: &ProtocolManifest,
-    claim: &ElementsBurnClaim,
-    proof: &V::Proof,
-) -> Result<StrictJournal, GuestError> {
-    manifest
-        .validate()
-        .map_err(|_| GuestError::InvalidManifest)?;
-    let manifest_id = manifest
-        .manifest_id()
-        .map_err(|_| GuestError::InvalidManifest)?;
-    if claim.manifest_id != manifest_id {
-        return Err(GuestError::ManifestMismatch);
-    }
-    claim.burn.validate().map_err(|_| GuestError::InvalidBurn)?;
-    if claim.burn.vault_id != manifest.vault_id || claim.burn.usdd_asset != manifest.usdd_asset {
-        return Err(GuestError::BurnTargetsWrongAssetOrVault);
-    }
-    let redemption_id = claim.burn.redemption_id(manifest.elements_genesis);
-    let expected_payload_commitment = hash_bytes(&claim.burn.burn_payload().encode());
-    if claim.event.kind != ElementsEventKind::Burn
-        || claim.event.event_id != redemption_id
-        || claim.event.outpoint != claim.burn.burn_outpoint
-        || claim.event.usdd_amount_base != claim.burn.usdd_amount_base
-        || claim.event.payload_commitment != expected_payload_commitment
-    {
-        return Err(GuestError::ElementsEventMismatch);
-    }
-    if claim.event.bitcoin_confirmations < manifest.minimum_bitcoin_confirmations {
-        return Err(GuestError::InsufficientBitcoinConfirmations);
-    }
-
-    verifier
-        .verify_canonical_burn(manifest, claim, proof)
-        .map_err(GuestError::VerifierRejected)?;
-
-    let output = RedemptionPublicOutput {
-        manifest_id,
-        claim_id: claim.claim_id(),
-        redemption_id,
-        burn: claim.burn.clone(),
-        elements_block_hash: claim.event.elements_block_hash,
-        bitcoin_bmm_block_hash: claim.event.bitcoin_bmm_block_hash,
-        bitcoin_confirmations: claim.event.bitcoin_confirmations,
-    };
-    StrictJournal::new(
-        StatementKind::ElementsBurn,
-        manifest.elements_guest_program_id,
         output.encode(),
     )
     .map_err(GuestError::Journal)
@@ -350,7 +285,7 @@ pub fn build_elements_state_journal<V: ElementsValidityProofVerifier>(
         next_state: claim.next_state.clone(),
     };
     StrictJournal::new(
-        StatementKind::ElementsBurn,
+        StatementKind::ElementsState,
         manifest.elements_guest_program_id,
         output.encode(),
     )
@@ -369,8 +304,6 @@ pub enum GuestError {
     InvalidControllerTransition,
     InvalidBurn,
     BurnTargetsWrongAssetOrVault,
-    ElementsEventMismatch,
-    InsufficientBitcoinConfirmations,
     InvalidElementsStateTransition,
     ActivationChainworkNotReached,
     BurnAccumulatorMismatch,
@@ -394,10 +327,6 @@ impl fmt::Display for GuestError {
             Self::InvalidBurn => f.write_str("invalid burn record"),
             Self::BurnTargetsWrongAssetOrVault => {
                 f.write_str("burn targets the wrong USDD asset or vault")
-            }
-            Self::ElementsEventMismatch => f.write_str("Elements event does not bind the burn"),
-            Self::InsufficientBitcoinConfirmations => {
-                f.write_str("fewer than the manifest's Bitcoin confirmations")
             }
             Self::InvalidElementsStateTransition => {
                 f.write_str("invalid old-to-next Elements bridge state")

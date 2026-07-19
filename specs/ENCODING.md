@@ -7,7 +7,8 @@ All consensus-facing encodings are fixed and language-neutral:
 - variable byte strings are prefixed by a big-endian `u32` byte length;
 - records start with `schema:u16 || type_tag:u16`, except the controller state
   below, whose consensus encoding is exactly 164 bytes with no prefix;
-- schema 1 is the only accepted schema;
+- schema 2 is the only accepted schema; schema 1 is permanently rejected
+  because it allowed a prover-supplied BMM-parent timestamp in Ethereum claims;
 - a decoder must consume every input byte;
 - no field is JSON, ABI dynamic data, native-endian, or implicitly typed.
 
@@ -24,7 +25,7 @@ SHA256(
 )
 ```
 
-Schema-1 domains are:
+Protocol-V1 domains under encoding schema 2 are:
 
 | Purpose | Domain |
 |---|---|
@@ -33,10 +34,10 @@ Schema-1 domains are:
 | Merkle internal node | `USDD/1/merkle-node` |
 | deployment manifest | `USDD/1/manifest` |
 | non-circular controller configuration | `USDD/1/controller-config` |
+| non-circular outbound verifier configuration | `USDD/1/outbound-verifier-config` |
 | Ethereum proof claim | `USDD/1/claim/ethereum-state` |
 | Elements proof claim and bound burn payload | `USDD/1/claim/elements-event` |
 | deposit public output | `USDD/1/public/deposit` |
-| redemption public output | `USDD/1/public/redemption` |
 
 The Ethereum-compatible vault ID, deposit ID, Elements-state chain,
 Elements-state verifier statement, burn ID, and burn leaf do **not** use that
@@ -52,15 +53,26 @@ The public-values journal is exactly:
 
 ```text
 magic[8]              = ASCII "USDDJNL1"
-schema:u16            = 1
+schema:u16            = 2
 digest_algorithm:u8   = 1 (SHA-256 only)
 success_marker[8]     = ASCII "SUCCESS!"
-statement_kind:u8     = 1 Ethereum state, 2 Elements state/burn append
+statement_kind:u8     = 1 Ethereum state, 2 Elements state
 program_id[32]
 payload_sha256[32]    = SHA256(payload)
 payload_length:u32
 payload[payload_length]
 ```
+
+The payload is not opaque. Kind 1 accepts exactly one canonical deposit public
+output (tag `0x5201`) or heartbeat public output (tag `0x5204`). Kind 2 accepts
+exactly one canonical cumulative Elements-state public output (tag `0x5203`).
+The per-burn diagnostic journal from the earlier draft is not an authorization
+path and is not part of the production API.
+
+Both Ethereum public outputs carry the finalized execution block timestamp
+proved by Ethereum consensus. They never carry BMM parent MTP. The Elements
+controller obtains parent MTP only from its authenticated block-validation
+environment and enforces `abs(execution_timestamp - parent_mtp) <= 21600`.
 
 The wrapper must reject a BLAKE3/alternate digest tag, absent or changed
 success marker, wrong program ID, wrong statement kind, payload hash mismatch,
@@ -68,6 +80,12 @@ unknown schema, noncanonical record, and every trailing byte. These checks are
 mandatory even when an underlying raw SP1 verifier is more permissive about
 public-value digest algorithms or does not expose an explicit guest exit-code
 check.
+
+The 32-byte SP1 program ID is exactly `HashableKey::hash_bytes`: eight
+canonical KoalaBear field words encoded big-endian. It is not
+`SHA256(serialized_vkey)`. SP1's raw compressed-verifier API consumes the same
+eight words as fixed-width little-endian bincode bytes; the verifier adapter
+performs and checks that wordwise conversion.
 
 ## Native amount rule
 
@@ -80,6 +98,15 @@ USDD base units = USDT micro-units × 100
 
 Mint multiplication must not overflow `u64`. Redemption amounts must be
 exactly divisible by 100; sub-micro-USDT dust cannot be redeemed.
+A canonical deposit amount is no greater than `20_000_000_000_000`
+micro-USDT, matching the immutable vault's 20,000,000-USDT per-deposit limit.
+A mint batch has the same aggregate cap. The resulting
+`2_000_000_000_000_000` USDD base units leave
+`100_000_000_000_000` explicit-value units below Elements' cross-asset,
+transaction-wide `MAX_MONEY` sum for the singleton reissuance-token output,
+fees, and non-protocol change. A canonical burn uses the same 20,000,000-USDT
+ceiling so the burn transaction can include an explicit fee; larger
+redemptions are split into multiple burns.
 
 ## Mint controller state
 
@@ -122,6 +149,24 @@ SHA256(0x00 || keccak256("USDD_BURN_LEAF_V1") || version:u32 ||
 The burn ID is `SHA256(SHA256("USDD_BURN_ID_V1") || elements_genesis ||
 burn_txid_display || vout:u32)`. Transaction-ID bytes are RPC/display order,
 left to right; internal consensus-order hashes must be reversed first.
+
+## Outbound Elements bridge state
+
+The Solidity-compatible state contents are exactly 200 packed bytes:
+
+```text
+sequence:u64 || burn_count:u64 || elements_tip_hash[32] ||
+elements_consensus_state_digest[32] || cumulative_burn_root[32] ||
+finalized_bitcoin_block_hash[32] || bitcoin_height:u64 ||
+elements_height:u64 || bitcoin_median_time_past:u64 ||
+bitcoin_chainwork:u256
+```
+
+`elements_consensus_state_digest` commits the deterministic full state needed
+to validate the next Elements transition incrementally, including the UTXO set
+and consensus/activation context at the committed tip. A tip hash alone is not
+an incremental validity state. Every non-bootstrap transition must advance this
+digest.
 
 ## General-purpose ordered Merkle tree (not redemption consensus)
 

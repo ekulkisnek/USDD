@@ -16,9 +16,13 @@ contract USDDVaultV1 {
 
     uint32 public constant PROTOCOL_VERSION = 1;
     uint256 public constant BURN_TREE_DEPTH = 64;
+    uint64 public constant MAX_BURNS_PER_STATE_TRANSITION = 64;
     uint256 public constant MAX_ELEMENTS_SCRIPT_LENGTH = 128;
-    uint64 public constant MAX_DEPOSIT_AMOUNT_USDT6 = 21_000_000e6;
+    uint64 public constant MAX_DEPOSIT_AMOUNT_USDT6 = 20_000_000e6;
+    uint64 public constant MAX_BURN_AMOUNT_USDT6 = 20_000_000e6;
     uint256 public constant ACTIVE_LIABILITY_CAP_USDT6 = 1_000_000_000e6;
+    bytes32 public constant EMPTY_BURN_ROOT =
+        0xc13fcc5e95b202155d131894da01dff87c8ac722937c76415daab46e53ed40db;
 
     bytes32 public constant VAULT_ID_DOMAIN = keccak256("USDD_VAULT_ID_V1");
     bytes32 public constant DEPOSIT_ID_DOMAIN = keccak256("USDD_DEPOSIT_ID_V1");
@@ -44,6 +48,7 @@ contract USDDVaultV1 {
         uint64 sequence;
         uint64 burnCount;
         bytes32 elementsTipHash;
+        bytes32 elementsConsensusStateDigest;
         bytes32 cumulativeBurnRoot;
         bytes32 finalizedBitcoinBlockHash;
         uint64 bitcoinHeight;
@@ -89,7 +94,10 @@ contract USDDVaultV1 {
     error ReentrantCall();
     error WrongStateSequence(uint64 expected, uint64 supplied);
     error DecreasingBurnCount(uint64 current, uint64 proposed);
+    error BurnCountGrowthAboveMaximum(uint64 growth, uint64 maximum);
+    error NonCanonicalEmptyBurnRoot(bytes32 supplied, bytes32 expected);
     error BurnRootChangedWithoutNewBurn(bytes32 current, bytes32 proposed);
+    error ElementsConsensusStateDidNotAdvance(bytes32 current);
     error InvalidElementsState();
     error NonIncreasingBitcoinHeight(uint64 current, uint64 proposed);
     error NonIncreasingElementsHeight(uint64 current, uint64 proposed);
@@ -329,7 +337,8 @@ contract USDDVaultV1 {
         bytes32 expectedBurnId = computeBurnId(claim.burnTxid, claim.burnVout);
         if (claim.burnId != expectedBurnId) revert WrongBurnId(expectedBurnId, claim.burnId);
         if (
-            claim.burnId == bytes32(0) || claim.amountUSDT6 == 0 || claim.recipient == address(0)
+            claim.burnId == bytes32(0) || claim.amountUSDT6 == 0
+                || claim.amountUSDT6 > MAX_BURN_AMOUNT_USDT6 || claim.recipient == address(0)
                 || claim.recipient == address(this)
         ) {
             revert InvalidBurnClaim();
@@ -380,6 +389,10 @@ contract USDDVaultV1 {
 
     /// @notice Exact 65-byte Elements burn payload committed by the proof guest.
     function encodeBurnPayload(address recipient, uint64 amountUSDT6) external view returns (bytes memory) {
+        if (
+            recipient == address(0) || recipient == address(this) || amountUSDT6 == 0
+                || amountUSDT6 > MAX_BURN_AMOUNT_USDT6
+        ) revert InvalidBurnClaim();
         return abi.encodePacked(BURN_PAYLOAD_MAGIC, BURN_PAYLOAD_VERSION, VAULT_ID, recipient, amountUSDT6);
     }
 
@@ -400,6 +413,13 @@ contract USDDVaultV1 {
         if (next.burnCount < finalizedState.burnCount) {
             revert DecreasingBurnCount(finalizedState.burnCount, next.burnCount);
         }
+        uint64 burnCountGrowth = next.burnCount - finalizedState.burnCount;
+        if (burnCountGrowth > MAX_BURNS_PER_STATE_TRANSITION) {
+            revert BurnCountGrowthAboveMaximum(burnCountGrowth, MAX_BURNS_PER_STATE_TRANSITION);
+        }
+        if (next.burnCount == 0 && next.cumulativeBurnRoot != EMPTY_BURN_ROOT) {
+            revert NonCanonicalEmptyBurnRoot(next.cumulativeBurnRoot, EMPTY_BURN_ROOT);
+        }
         if (
             finalizedState.sequence != 0 && next.burnCount == finalizedState.burnCount
                 && next.cumulativeBurnRoot != finalizedState.cumulativeBurnRoot
@@ -407,8 +427,14 @@ contract USDDVaultV1 {
             revert BurnRootChangedWithoutNewBurn(finalizedState.cumulativeBurnRoot, next.cumulativeBurnRoot);
         }
         if (
-            next.elementsTipHash == bytes32(0) || next.cumulativeBurnRoot == bytes32(0)
-                || next.finalizedBitcoinBlockHash == bytes32(0)
+            finalizedState.sequence != 0
+                && next.elementsConsensusStateDigest == finalizedState.elementsConsensusStateDigest
+        ) {
+            revert ElementsConsensusStateDidNotAdvance(finalizedState.elementsConsensusStateDigest);
+        }
+        if (
+            next.elementsTipHash == bytes32(0) || next.elementsConsensusStateDigest == bytes32(0)
+                || next.cumulativeBurnRoot == bytes32(0) || next.finalizedBitcoinBlockHash == bytes32(0)
         ) revert InvalidElementsState();
 
         ElementsBridgeState memory current = finalizedState;
@@ -440,6 +466,7 @@ contract USDDVaultV1 {
                 state_.sequence,
                 state_.burnCount,
                 state_.elementsTipHash,
+                state_.elementsConsensusStateDigest,
                 state_.cumulativeBurnRoot,
                 state_.finalizedBitcoinBlockHash,
                 state_.bitcoinHeight,

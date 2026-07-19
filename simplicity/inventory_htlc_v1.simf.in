@@ -1,33 +1,52 @@
+simc "0.6.0";
+
 /*
- * Inventory-only Elements HTLC V1 -- NONCOMPILED DESIGN TEMPLATE.
- * Current semantic result: FAIL_CLOSED.
+ * USDD inventory HTLC V1 -- SOURCE TEMPLATE ONLY.
+ *
+ * This program spends already-existing Elements inventory. It does not issue,
+ * reissue, burn, bridge, or verify an external-chain proof.
+ *
+ * Render every uppercase parameter token with render_inventory_htlc.py. The
+ * rendered program is still not deployable until its compiled Simplicity
+ * encoding is shown to be compatible with the exact vendored Simplicity
+ * implementation in Elements.
  */
 
-inventory_htlc_v1 := FAIL_CLOSED
+fn sha256_32(preimage: u256) -> u256 {
+    let context: Ctx8 = jet::sha_256_ctx_8_init();
+    let context: Ctx8 = jet::sha_256_ctx_8_add_32(context, preimage);
+    jet::sha_256_ctx_8_finalize(context)
+}
 
-/* Future outline after compiling against a pinned SimplicityHL release:
- *
- * constants:
- *   secretHash = SHA256(SECRET[32])
- *   claimantScriptHash
- *   refundScriptHash
- *   assetId
- *   amount
- *   elementsRefundDeadline
- *
- * common:
- *   require(current_input_has_explicit(assetId, amount))
- *   require(no_issuance_or_reissuance_anywhere())
- *   require(no_burn_of_protected_asset())
- *
- * claim(secret[32]):
- *   require(sha256(secret) == secretHash)
- *   require(exact_explicit_output(claimantScriptHash, assetId, amount))
- *
- * refund:
- *   require(absolute_locktime_reached(elementsRefundDeadline))
- *   require(exact_explicit_output(refundScriptHash, assetId, amount))
- *
- * Fees come only from separate policy-asset inputs. The template must be
- * compiled, CMR-pinned, and transaction-tested before use.
- */
+fn verify_all_signature(pubkey: Pubkey, signature: Signature) {
+    let message: u256 = jet::sig_all_hash();
+    jet::bip_0340_verify((pubkey, message), signature);
+}
+
+fn claim(preimage: u256, claimant_signature: Signature) {
+    let actual_hash: u256 = sha256_32(preimage);
+    let expected_hash: u256 = 0x@SECRET_HASH@;
+    assert!(jet::eq_256(actual_hash, expected_hash));
+
+    let claimant_pubkey: Pubkey = 0x@CLAIMANT_XONLY_PUBKEY@;
+    verify_all_signature(claimant_pubkey, claimant_signature);
+}
+
+fn refund(refund_signature: Signature) {
+    /* A Time is an absolute nLockTime timestamp, not a height or duration. */
+    let elements_refund_timestamp: Time = @ELEMENTS_REFUND_TIMESTAMP@;
+    jet::check_lock_time(elements_refund_timestamp);
+
+    let refund_pubkey: Pubkey = 0x@REFUND_XONLY_PUBKEY@;
+    verify_all_signature(refund_pubkey, refund_signature);
+}
+
+fn main() {
+    match witness::CLAIM_OR_REFUND {
+        Left(claim_data: (u256, Signature)) => {
+            let (preimage, claimant_signature): (u256, Signature) = claim_data;
+            claim(preimage, claimant_signature);
+        },
+        Right(refund_signature: Signature) => refund(refund_signature),
+    }
+}

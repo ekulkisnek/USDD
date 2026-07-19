@@ -12,7 +12,10 @@ pub mod manifest;
 pub mod merkle;
 pub mod types;
 
-pub use audit::{AuditError, AuditReport, AuditSnapshot};
+pub use audit::{
+    reconstruct_audit_snapshot, AuditError, AuditReport, AuditSnapshot, AuditedBurn,
+    AuditedDeposit, AuditedMint, AuditedPayout,
+};
 pub use burn_accumulator::{
     burn_accumulator_empty, burn_accumulator_node, BurnAccumulator, BurnAccumulatorError,
     BurnProof, BURN_ACCUMULATOR_DEPTH,
@@ -32,7 +35,13 @@ pub use merkle::{
 pub use types::*;
 
 /// Canonical protocol encoding schema.
-pub const ENCODING_SCHEMA: u16 = 1;
+///
+/// Schema 2 removes caller-supplied Bitcoin parent time from Ethereum proof
+/// claims, adds the Ethereum-proved execution timestamp to public values, and
+/// commits the outbound Elements consensus state. Schema 1 is intentionally
+/// rejected to prevent old claim bytes being reinterpreted under the corrected
+/// authorization boundary.
+pub const ENCODING_SCHEMA: u16 = 2;
 
 /// The eCash Elements Drivechain slot committed by this protocol.
 pub const DRIVECHAIN_SLOT: u8 = 24;
@@ -59,6 +68,23 @@ pub const SHA256_DIGEST_TAG: u8 = 1;
 pub const MAX_ETHEREUM_FINALITY_SLOT_GAP: u64 = 4_096;
 pub const MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS: u64 = 6 * 60 * 60;
 pub const MINIMUM_BITCOIN_CONFIRMATIONS: u32 = 100;
+pub const MAX_BURN_APPENDS_PER_STATE_TRANSITION: usize = 64;
+/// Elements' context-free transaction rule caps the sum of every explicit
+/// output value, across all assets, at 21 million eight-decimal base units.
+pub const ELEMENTS_MAX_EXPLICIT_OUTPUT_TOTAL_BASE: u64 = 21_000_000 * USDD_SCALE;
+/// Reserve one million display units of transaction-wide explicit-value
+/// headroom for the singleton reissuance token, fees, and non-protocol change.
+pub const MINT_TRANSACTION_EXPLICIT_HEADROOM_BASE: u64 = 1_000_000 * USDD_SCALE;
+/// Maximum USDD that one controller transaction may reissue.
+pub const MAX_MINT_BATCH_USDD_BASE: u64 =
+    ELEMENTS_MAX_EXPLICIT_OUTPUT_TOTAL_BASE - MINT_TRANSACTION_EXPLICIT_HEADROOM_BASE;
+/// Equivalent six-decimal USDT principal represented by the batch cap.
+pub const MAX_MINT_BATCH_USDT_MICRO: u64 = MAX_MINT_BATCH_USDD_BASE / USDD_UNITS_PER_USDT_MICRO;
+/// An immutable deposit must fit by itself in a valid mint transaction.
+pub const MAX_DEPOSIT_AMOUNT_USDT_MICRO: u64 = MAX_MINT_BATCH_USDT_MICRO;
+/// A canonical burn must also leave transaction-wide room for an explicit fee.
+pub const MAX_BURN_AMOUNT_USDD_BASE: u64 = MAX_MINT_BATCH_USDD_BASE;
+pub const MAX_BURN_AMOUNT_USDT_MICRO: u64 = MAX_MINT_BATCH_USDT_MICRO;
 pub const ACTIVE_LIABILITY_CAP_USDT_MICRO: u64 = 1_000_000_000_000_000;
 
 pub fn usdt_micro_to_usdd_base(amount: u64) -> Option<u64> {

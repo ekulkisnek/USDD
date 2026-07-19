@@ -23,7 +23,7 @@ public values are 1..16 KiB.
 | 13 | 2 | flags | `0` |
 | 15 | 4 | public-values length | `1..16384` |
 | 19 | 4 | proof length | nonzero |
-| 23 | 32 | Ethereum guest VK hash | nonzero |
+| 23 | 32 | Ethereum guest program ID (`HashableKey::hash_bytes`) | nonzero |
 | 55 | variable | public values | exact declared length |
 | ... | variable | opaque proof | exact declared length |
 
@@ -32,6 +32,20 @@ heartbeat transition. That choice is part of the strict verified journal, not a
 second annex kind. `0x50 || "USDD"` reserves the namespace. Kind 2 is rejected: an Elements burn
 proof is submitted to Ethereum and has no reason to be consumed by Elements.
 Successful parsing is never proof authorization.
+
+### Timestamp authorization boundary
+
+The strictly typed `ETH_STATE_V1` journal includes the finalized Ethereum
+execution-block timestamp proved by the Ethereum guest. Neither the Ethereum
+claim nor its public output includes a BMM parent MTP. A field supplied by the
+prover or guest host and labelled as BMM MTP is noncanonical.
+
+At controller execution, `current_bmm_parent_mtp` comes only from the Elements
+environment jet after block validation authenticates the BIP301 parent context.
+The controller requires the absolute difference between that value and the
+journal's proved execution timestamp to be at most `21,600` seconds, using
+checked unsigned arithmetic. Wall-clock time and an unbound RPC response are not
+authorization.
 
 ## Controller state record
 
@@ -61,8 +75,11 @@ USDT uses six decimal contract units and USDD uses eight decimal asset units:
 amountUSDD8 = amountUSDT6 * 100
 ```
 
-Both the per-deposit multiplication and batch sum use checked `u64`. A mint
-batch has 1..64 nonces and the exact list is
+Both the per-deposit multiplication and batch sum use checked `u64`. One
+deposit and one aggregate batch are capped at 20,000,000 USDT /
+2,000,000,000,000,000 USDD base units, leaving
+100,000,000,000,000 units of Elements transaction-wide explicit-output
+headroom. A mint batch has 1..64 nonces and the exact list is
 `nextMintNonce .. nextMintNonce + count - 1`.
 
 ## Canonical Elements burn
@@ -75,7 +92,7 @@ The burn data is exactly 65 bytes:
 | 4 | 1 | version | `1` |
 | 5 | 32 | Ethereum `vaultId` | nonzero |
 | 37 | 20 | Ethereum recipient | nonzero |
-| 57 | 8 | `amountUSDT6` | positive |
+| 57 | 8 | `amountUSDT6` | `1..20,000,000e6` |
 
 The exact script is 67 bytes:
 
@@ -163,8 +180,10 @@ issuance transaction, or prove that a CMR is deployable.
 
 ## Inventory HTLC parameters
 
-The inventory HTLC has no canonical bridge payload. Its immutable deployment
+The inventory HTLC has no canonical bridge payload. Its source-template
 parameters are validated as described in `INVENTORY_HTLC_V1.md`: one nonzero
-SHA-256 secret hash, distinct nonzero claimant/refund script hashes, one exact
-nonzero asset/amount, Elements absolute refund deadline, and external refund
-deadline at least 86,400 seconds later.
+SHA-256 secret hash, distinct valid claimant/refund x-only secp256k1 public
+keys, an Elements absolute timestamp refund deadline, and an external refund
+timestamp at least 86,400 seconds later. Asset and amount belong to the funded
+Elements UTXO; both branches require the appropriate fixed key to sign the
+complete transaction's `sig_all_hash`.

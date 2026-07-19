@@ -1,0 +1,15 @@
+format_version=1
+repository=https://github.com/succinctlabs/sp1-helios
+tag=v1.2.0
+commit=07096e1955bce67546fb9b185772296d41ef0eaa
+license=MIT
+reference_sp1_version=6.2.4
+reference_helios_tag=0.11.1
+reference_helios_commit=204c998a927348e1c000a664f08d5b37b1b0d924
+reference_alloy_trie=0.9.1
+reference_alloy_primitives=1.3.1
+reference_alloy_rlp=0.3.12
+usdd_required_sp1_version=6.3.1
+usdd_required_sp1_commit=8252c2905ce32964df68248117015c61ebb854db
+reference_elf_accepted=false
+reference_proof_accepted=false

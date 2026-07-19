@@ -2,10 +2,13 @@ use alloc::vec::Vec;
 use core::{fmt, str::FromStr};
 
 use crate::{
+    burn_accumulator::burn_accumulator_empty,
     encoding::{CanonicalDecode, CanonicalEncode, DecodeError, Decoder},
     hash::{decode_hex, hash_bytes, Hash32, HexError},
-    usdd_base_to_usdt_micro, usdt_micro_to_usdd_base, ENCODING_SCHEMA,
-    MAX_ETHEREUM_FINALITY_SLOT_GAP, MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS,
+    usdd_base_to_usdt_micro, usdt_micro_to_usdd_base, ENCODING_SCHEMA, MAX_BURN_AMOUNT_USDD_BASE,
+    MAX_BURN_AMOUNT_USDT_MICRO, MAX_BURN_APPENDS_PER_STATE_TRANSITION,
+    MAX_DEPOSIT_AMOUNT_USDT_MICRO, MAX_ETHEREUM_FINALITY_SLOT_GAP,
+    MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS, MAX_MINT_BATCH_USDD_BASE, MAX_MINT_BATCH_USDT_MICRO,
     USDD_UNITS_PER_USDT_MICRO,
 };
 
@@ -166,10 +169,12 @@ impl VaultDeposit {
         if self.vault.is_zero() || self.usdt.is_zero() || self.depositor.is_zero() {
             return Err(DecodeError::InvalidValue("zero Ethereum address"));
         }
-        if self.usdt_amount_micro == 0 || usdt_micro_to_usdd_base(self.usdt_amount_micro).is_none()
+        if self.usdt_amount_micro == 0
+            || self.usdt_amount_micro > MAX_DEPOSIT_AMOUNT_USDT_MICRO
+            || usdt_micro_to_usdd_base(self.usdt_amount_micro).is_none()
         {
             return Err(DecodeError::InvalidValue(
-                "invalid or overflowing USDT amount",
+                "invalid, excessive, or overflowing USDT amount",
             ));
         }
         if self.elements_script.is_empty()
@@ -330,7 +335,10 @@ impl MintOutput {
         if self.deposit_id == Hash32::ZERO {
             return Err(DecodeError::InvalidValue("zero deposit ID"));
         }
-        if usdt_micro_to_usdd_base(self.usdt_amount_micro) != Some(self.usdd_amount_base) {
+        if self.usdt_amount_micro == 0
+            || self.usdt_amount_micro > MAX_DEPOSIT_AMOUNT_USDT_MICRO
+            || usdt_micro_to_usdd_base(self.usdt_amount_micro) != Some(self.usdd_amount_base)
+        {
             return Err(DecodeError::InvalidValue("USDT/USDD conversion mismatch"));
         }
         if self.elements_script.is_empty()
@@ -423,6 +431,13 @@ impl MintBatch {
                 .checked_add(output.usdd_amount_base)
                 .ok_or(DecodeError::InvalidValue("batch USDD total overflow"))
         })?;
+        if total_usdt_amount_micro > MAX_MINT_BATCH_USDT_MICRO
+            || total_usdd_amount_base > MAX_MINT_BATCH_USDD_BASE
+        {
+            return Err(DecodeError::InvalidValue(
+                "mint batch exceeds Elements explicit-output budget",
+            ));
+        }
         Ok(Self {
             first_nonce: first.nonce,
             next_nonce,
@@ -468,6 +483,11 @@ impl MintBatch {
             || usdt_micro_to_usdd_base(usdt_total) != Some(usdd_total)
         {
             return Err(DecodeError::InvalidValue("wrong mint batch totals"));
+        }
+        if usdt_total > MAX_MINT_BATCH_USDT_MICRO || usdd_total > MAX_MINT_BATCH_USDD_BASE {
+            return Err(DecodeError::InvalidValue(
+                "mint batch exceeds Elements explicit-output budget",
+            ));
         }
         Ok(())
     }
@@ -545,6 +565,11 @@ impl Burn {
                 "burn is not exactly convertible to micro-USDT",
             ));
         }
+        if self.usdd_amount_base > MAX_BURN_AMOUNT_USDD_BASE {
+            return Err(DecodeError::InvalidValue(
+                "burn exceeds Elements explicit-output limit",
+            ));
+        }
         Ok(())
     }
 
@@ -597,6 +622,8 @@ impl BurnPayload {
         if self.vault_id == Hash32::ZERO
             || self.ethereum_recipient.is_zero()
             || self.amount_usdt_micro == 0
+            || self.amount_usdt_micro > MAX_BURN_AMOUNT_USDT_MICRO
+            || usdt_micro_to_usdd_base(self.amount_usdt_micro).is_none()
         {
             return Err(DecodeError::InvalidValue("invalid burn payload"));
         }
@@ -837,6 +864,10 @@ pub struct SolidityElementsBridgeState {
     pub sequence: u64,
     pub burn_count: u64,
     pub elements_tip_hash: Hash32,
+    /// Commitment to the deterministic full Elements consensus state needed
+    /// to continue validation incrementally (including the UTXO set and the
+    /// consensus/activation context at `elements_tip_hash`).
+    pub elements_consensus_state_digest: Hash32,
     pub cumulative_burn_root: Hash32,
     pub finalized_bitcoin_block_hash: Hash32,
     pub bitcoin_height: u64,
@@ -851,6 +882,7 @@ impl SolidityElementsBridgeState {
         self.sequence == 0
             && self.burn_count == 0
             && self.elements_tip_hash == Hash32::ZERO
+            && self.elements_consensus_state_digest == Hash32::ZERO
             && self.cumulative_burn_root == Hash32::ZERO
             && self.finalized_bitcoin_block_hash == Hash32::ZERO
             && self.bitcoin_height == 0
@@ -864,11 +896,21 @@ impl SolidityElementsBridgeState {
             return Ok(());
         }
         if self.elements_tip_hash == Hash32::ZERO
+            || self.elements_consensus_state_digest == Hash32::ZERO
             || self.cumulative_burn_root == Hash32::ZERO
             || self.finalized_bitcoin_block_hash == Hash32::ZERO
             || self.bitcoin_chainwork == Hash32::ZERO
         {
             return Err(DecodeError::InvalidValue("invalid Solidity Elements state"));
+        }
+        if self.burn_count == 0
+            && self.cumulative_burn_root
+                != burn_accumulator_empty(64)
+                    .expect("V1 burn accumulator depth is statically valid")
+        {
+            return Err(DecodeError::InvalidValue(
+                "noncanonical empty burn accumulator root",
+            ));
         }
         Ok(())
     }
@@ -892,12 +934,24 @@ impl SolidityElementsBridgeState {
         if next.burn_count < self.burn_count {
             return Err(DecodeError::InvalidValue("burn count decreased"));
         }
+        if next.burn_count - self.burn_count > MAX_BURN_APPENDS_PER_STATE_TRANSITION as u64 {
+            return Err(DecodeError::InvalidValue(
+                "too many burns in one Elements state transition",
+            ));
+        }
         if self.sequence != 0
             && next.burn_count == self.burn_count
             && next.cumulative_burn_root != self.cumulative_burn_root
         {
             return Err(DecodeError::InvalidValue(
                 "burn root changed without a burn",
+            ));
+        }
+        if self.sequence != 0
+            && next.elements_consensus_state_digest == self.elements_consensus_state_digest
+        {
+            return Err(DecodeError::InvalidValue(
+                "Elements consensus state digest did not advance",
             ));
         }
         if next.bitcoin_height <= self.bitcoin_height
@@ -912,19 +966,20 @@ impl SolidityElementsBridgeState {
         Ok(())
     }
 
-    /// Solidity `abi.encodePacked` state contents (168 bytes, no Rust tag).
+    /// Solidity `abi.encodePacked` state contents (200 bytes, no Rust tag).
     pub fn packed_contents(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(168);
+        let mut out = Vec::with_capacity(200);
         self.sequence.encode_to(&mut out);
         self.burn_count.encode_to(&mut out);
         self.elements_tip_hash.encode_to(&mut out);
+        self.elements_consensus_state_digest.encode_to(&mut out);
         self.cumulative_burn_root.encode_to(&mut out);
         self.finalized_bitcoin_block_hash.encode_to(&mut out);
         self.bitcoin_height.encode_to(&mut out);
         self.elements_height.encode_to(&mut out);
         self.bitcoin_median_time_past.encode_to(&mut out);
         self.bitcoin_chainwork.encode_to(&mut out);
-        debug_assert_eq!(out.len(), 168);
+        debug_assert_eq!(out.len(), 200);
         out
     }
 
@@ -947,6 +1002,7 @@ impl CanonicalDecode for SolidityElementsBridgeState {
             sequence: decoder.u64()?,
             burn_count: decoder.u64()?,
             elements_tip_hash: Hash32::decode_from(decoder)?,
+            elements_consensus_state_digest: Hash32::decode_from(decoder)?,
             cumulative_burn_root: Hash32::decode_from(decoder)?,
             finalized_bitcoin_block_hash: Hash32::decode_from(decoder)?,
             bitcoin_height: decoder.u64()?,
@@ -1028,7 +1084,6 @@ impl MintControllerState {
         &self,
         batch: &MintBatch,
         finality: &EthereumFinalityWitness,
-        authenticated_bmm_parent_mtp: u64,
     ) -> Result<Self, DecodeError> {
         self.validate()?;
         batch.validate()?;
@@ -1036,7 +1091,7 @@ impl MintControllerState {
         if batch.first_nonce != self.next_mint_nonce {
             return Err(DecodeError::InvalidValue("mint batch nonce is not next"));
         }
-        self.validate_finality_advance(finality, authenticated_bmm_parent_mtp)?;
+        self.validate_finality_advance(finality)?;
         let next = Self {
             version: self.version,
             sequence: self
@@ -1060,11 +1115,7 @@ impl MintControllerState {
 
     /// Permissionless state-only transition used to keep the continuous light
     /// client within the 4096-slot proof window when there are no deposits.
-    pub fn apply_heartbeat(
-        &self,
-        finality: &EthereumFinalityWitness,
-        authenticated_bmm_parent_mtp: u64,
-    ) -> Result<Self, DecodeError> {
+    pub fn apply_heartbeat(&self, finality: &EthereumFinalityWitness) -> Result<Self, DecodeError> {
         self.validate()?;
         finality.validate()?;
         if finality.finalized_beacon_slot <= self.finalized_beacon_slot {
@@ -1072,7 +1123,7 @@ impl MintControllerState {
                 "heartbeat must advance to a strictly newer finalized beacon slot",
             ));
         }
-        self.validate_finality_advance(finality, authenticated_bmm_parent_mtp)?;
+        self.validate_finality_advance(finality)?;
         let next = Self {
             version: self.version,
             sequence: self
@@ -1094,7 +1145,6 @@ impl MintControllerState {
     fn validate_finality_advance(
         &self,
         finality: &EthereumFinalityWitness,
-        authenticated_bmm_parent_mtp: u64,
     ) -> Result<(), DecodeError> {
         if finality.finalized_beacon_slot < self.finalized_beacon_slot {
             return Err(DecodeError::InvalidValue("Ethereum finality regressed"));
@@ -1108,13 +1158,6 @@ impl MintControllerState {
                 "Ethereum finalized slot gap exceeds 4096",
             ));
         }
-        let time_difference =
-            authenticated_bmm_parent_mtp.abs_diff(finality.execution_block_timestamp);
-        if time_difference > MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS {
-            return Err(DecodeError::InvalidValue(
-                "Ethereum finalized time differs from BMM parent MTP by over six hours",
-            ));
-        }
         if finality.finalized_beacon_slot == self.finalized_beacon_slot
             && self.finalized_beacon_slot != 0
             && (finality.finalized_beacon_root != self.finalized_beacon_root
@@ -1125,8 +1168,38 @@ impl MintControllerState {
                 "conflicting Ethereum state at the same finalized slot",
             ));
         }
+        if finality.finalized_beacon_slot > self.finalized_beacon_slot
+            && finality.ethereum_light_client_digest == self.ethereum_light_client_digest
+        {
+            return Err(DecodeError::InvalidValue(
+                "Ethereum light-client digest did not advance",
+            ));
+        }
         Ok(())
     }
+}
+
+/// Validate the cross-chain freshness check performed by the Elements
+/// controller. `execution_block_timestamp` is proved by the Ethereum guest;
+/// `authenticated_bmm_parent_mtp` must come from the block-validation
+/// environment and must never be supplied by that guest or its prover.
+pub fn validate_bmm_finality_freshness(
+    execution_block_timestamp: u64,
+    authenticated_bmm_parent_mtp: u64,
+) -> Result<(), DecodeError> {
+    if execution_block_timestamp == 0 || authenticated_bmm_parent_mtp == 0 {
+        return Err(DecodeError::InvalidValue(
+            "zero Ethereum timestamp or BMM parent MTP",
+        ));
+    }
+    if execution_block_timestamp.abs_diff(authenticated_bmm_parent_mtp)
+        > MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS
+    {
+        return Err(DecodeError::InvalidValue(
+            "Ethereum finalized time differs from BMM parent MTP by over six hours",
+        ));
+    }
+    Ok(())
 }
 
 impl CanonicalEncode for MintControllerState {
@@ -1222,10 +1295,41 @@ mod tests {
     }
 
     #[test]
+    fn deposit_amount_matches_the_immutable_vault_limit() {
+        let mut at_limit = deposit(0);
+        at_limit.usdt_amount_micro = MAX_DEPOSIT_AMOUNT_USDT_MICRO;
+        at_limit.validate().unwrap();
+
+        let mut over_limit = at_limit;
+        over_limit.usdt_amount_micro = MAX_DEPOSIT_AMOUNT_USDT_MICRO + 1;
+        assert!(over_limit.validate().is_err());
+        assert!(VaultDeposit::decode_exact(&over_limit.encode()).is_err());
+    }
+
+    #[test]
     fn exact_amount_conversion_is_committed() {
         let batch = MintBatch::from_deposits(&[deposit(0)]).unwrap();
         assert_eq!(batch.total_usdd_amount_base, 123_456_700);
         assert_eq!(MintBatch::decode_exact(&batch.encode()).unwrap(), batch);
+    }
+
+    #[test]
+    fn mint_batch_preserves_elements_explicit_output_headroom() {
+        let mut first = deposit(0);
+        first.usdt_amount_micro = MAX_MINT_BATCH_USDT_MICRO / 2;
+        let mut second = deposit(1);
+        second.usdt_amount_micro = MAX_MINT_BATCH_USDT_MICRO / 2;
+        let at_limit = MintBatch::from_deposits(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(at_limit.total_usdd_amount_base, MAX_MINT_BATCH_USDD_BASE);
+
+        let mut over = deposit(2);
+        over.usdt_amount_micro = 1;
+        assert!(MintBatch::from_deposits(&[first, second, over]).is_err());
+
+        let mut zero = MintOutput::from_deposit(&deposit(0)).unwrap();
+        zero.usdt_amount_micro = 0;
+        zero.usdd_amount_base = 0;
+        assert!(zero.validate().is_err());
     }
 
     #[test]
@@ -1245,11 +1349,11 @@ mod tests {
     fn controller_consumes_batch_once_and_advances_sequence() {
         let batch = MintBatch::from_deposits(&[deposit(4), deposit(5)]).unwrap();
         let state = controller(4);
-        let next = state.apply_mint_batch(&batch, &finality(), 10).unwrap();
+        let next = state.apply_mint_batch(&batch, &finality()).unwrap();
         assert_eq!(next.sequence, 1);
         assert_eq!(next.next_mint_nonce, 6);
         assert_eq!(next.total_minted_usdd_base, 246_913_400);
-        assert!(next.apply_mint_batch(&batch, &finality(), 10).is_err());
+        assert!(next.apply_mint_batch(&batch, &finality()).is_err());
     }
 
     #[test]
@@ -1258,27 +1362,24 @@ mod tests {
         let mut sequence_overflow = controller(0);
         sequence_overflow.sequence = u64::MAX;
         assert!(sequence_overflow
-            .apply_mint_batch(&batch, &finality(), 10)
+            .apply_mint_batch(&batch, &finality())
             .is_err());
 
         let mut supply_overflow = controller(0);
         supply_overflow.total_minted_usdd_base = u64::MAX - (u64::MAX % 100);
         assert!(supply_overflow
-            .apply_mint_batch(&batch, &finality(), 10)
+            .apply_mint_batch(&batch, &finality())
             .is_err());
     }
 
     #[test]
-    fn finality_time_allows_small_skew_both_directions() {
-        let state = controller(0);
-        let mut witness = finality();
-        witness.execution_block_timestamp = 20_000;
-        assert!(state.apply_heartbeat(&witness, 20_100).is_ok());
-        assert!(state.apply_heartbeat(&witness, 19_900).is_ok());
-        assert!(state.apply_heartbeat(&witness, 20_000 + 21_601).is_err());
-        assert!(state.apply_heartbeat(&witness, 20_000 - 10_001).is_ok());
-        witness.execution_block_timestamp = 30_000;
-        assert!(state.apply_heartbeat(&witness, 8_399).is_err());
+    fn finality_freshness_uses_only_the_controller_environment() {
+        assert!(validate_bmm_finality_freshness(20_000, 20_100).is_ok());
+        assert!(validate_bmm_finality_freshness(20_000, 19_900).is_ok());
+        assert!(validate_bmm_finality_freshness(20_000, 20_000 + 21_601).is_err());
+        assert!(validate_bmm_finality_freshness(30_000, 8_399).is_err());
+        assert!(validate_bmm_finality_freshness(0, 1).is_err());
+        assert!(validate_bmm_finality_freshness(1, 0).is_err());
     }
 
     #[test]
@@ -1286,12 +1387,13 @@ mod tests {
         let state = controller(0);
         let mut far = finality();
         far.finalized_beacon_slot = 8_193;
-        assert!(state.apply_heartbeat(&far, 10).is_err());
+        far.ethereum_light_client_digest = hash(31);
+        assert!(state.apply_heartbeat(&far).is_err());
 
         let mut middle = finality();
         middle.finalized_beacon_slot = 4_097;
-        let middle_state = state.apply_heartbeat(&middle, 10).unwrap();
-        let final_state = middle_state.apply_heartbeat(&far, 10).unwrap();
+        let middle_state = state.apply_heartbeat(&middle).unwrap();
+        let final_state = middle_state.apply_heartbeat(&far).unwrap();
         assert_eq!(final_state.sequence, 2);
         assert_eq!(final_state.next_mint_nonce, 0);
         assert_eq!(final_state.total_minted_usdd_base, 0);
@@ -1301,14 +1403,62 @@ mod tests {
     fn heartbeat_requires_newer_slot_but_mint_may_reuse_finalized_state() {
         let witness = finality();
         let state = controller(0);
-        let advanced = state.apply_heartbeat(&witness, 10).unwrap();
+        let advanced = state.apply_heartbeat(&witness).unwrap();
 
-        assert!(advanced.apply_heartbeat(&witness, 10).is_err());
+        assert!(advanced.apply_heartbeat(&witness).is_err());
 
         let batch = MintBatch::from_deposits(&[deposit(0)]).unwrap();
-        let minted = advanced.apply_mint_batch(&batch, &witness, 10).unwrap();
+        let minted = advanced.apply_mint_batch(&batch, &witness).unwrap();
         assert_eq!(minted.finalized_beacon_slot, witness.finalized_beacon_slot);
         assert_eq!(minted.next_mint_nonce, 1);
+    }
+
+    #[test]
+    fn outbound_state_requires_an_advancing_consensus_digest() {
+        let zero = SolidityElementsBridgeState {
+            sequence: 0,
+            burn_count: 0,
+            elements_tip_hash: Hash32::ZERO,
+            elements_consensus_state_digest: Hash32::ZERO,
+            cumulative_burn_root: Hash32::ZERO,
+            finalized_bitcoin_block_hash: Hash32::ZERO,
+            bitcoin_height: 0,
+            elements_height: 0,
+            bitcoin_median_time_past: 0,
+            bitcoin_chainwork: Hash32::ZERO,
+        };
+        let first = SolidityElementsBridgeState {
+            sequence: 1,
+            burn_count: 0,
+            elements_tip_hash: hash(21),
+            elements_consensus_state_digest: hash(22),
+            cumulative_burn_root: burn_accumulator_empty(64).unwrap(),
+            finalized_bitcoin_block_hash: hash(24),
+            bitcoin_height: 100,
+            elements_height: 10,
+            bitcoin_median_time_past: 1_700_000_000,
+            bitcoin_chainwork: hash(25),
+        };
+        zero.validate_successor(&first).unwrap();
+        assert_eq!(first.packed_contents().len(), 200);
+
+        let mut second = first.clone();
+        second.sequence = 2;
+        second.elements_tip_hash = hash(26);
+        second.finalized_bitcoin_block_hash = hash(27);
+        second.bitcoin_height += 1;
+        second.elements_height += 1;
+        second.bitcoin_median_time_past += 1;
+        second.bitcoin_chainwork = hash(28);
+        assert!(first.validate_successor(&second).is_err());
+        second.elements_consensus_state_digest = hash(29);
+        first.validate_successor(&second).unwrap();
+
+        let encoded = second.encode();
+        assert_eq!(
+            SolidityElementsBridgeState::decode_exact(&encoded).unwrap(),
+            second
+        );
     }
 
     #[test]
@@ -1325,5 +1475,25 @@ mod tests {
             ethereum_destination: address(4),
         };
         assert!(burn.validate().is_err());
+    }
+
+    #[test]
+    fn burn_preserves_elements_explicit_fee_headroom() {
+        let mut burn = Burn {
+            vault_id: hash(1),
+            usdd_asset: hash(2),
+            usdd_amount_base: MAX_BURN_AMOUNT_USDD_BASE,
+            usdt_amount_micro: MAX_BURN_AMOUNT_USDT_MICRO,
+            burn_outpoint: OutPoint {
+                txid: hash(3),
+                vout: 0,
+            },
+            ethereum_destination: address(4),
+        };
+        burn.validate().unwrap();
+        burn.usdd_amount_base += USDD_UNITS_PER_USDT_MICRO;
+        burn.usdt_amount_micro += 1;
+        assert!(burn.validate().is_err());
+        assert!(burn.burn_payload().validate().is_err());
     }
 }

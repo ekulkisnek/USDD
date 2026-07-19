@@ -2,14 +2,12 @@ use alloc::vec::Vec;
 
 use usdd_core::{
     domain_hash, Burn, BurnProof, CanonicalDecode, CanonicalEncode, DecodeError, Decoder, Domain,
-    ElementsEvent, EthereumFinalityWitness, Hash32, MintBatch, MintControllerState,
-    SolidityElementsBridgeState, VaultDeposit, ENCODING_SCHEMA, MAX_MINT_BATCH_SIZE,
+    EthereumFinalityWitness, Hash32, MintBatch, MintControllerState, SolidityElementsBridgeState,
+    VaultDeposit, ENCODING_SCHEMA, MAX_BURN_APPENDS_PER_STATE_TRANSITION, MAX_MINT_BATCH_SIZE,
 };
 
 const TAG_ETHEREUM_DEPOSIT_CLAIM: u16 = 0x5101;
-const TAG_ELEMENTS_BURN_CLAIM: u16 = 0x5102;
 const TAG_DEPOSIT_PUBLIC_OUTPUT: u16 = 0x5201;
-const TAG_REDEMPTION_PUBLIC_OUTPUT: u16 = 0x5202;
 const TAG_ELEMENTS_STATE_TRANSITION_CLAIM: u16 = 0x5103;
 const TAG_BURN_APPEND: u16 = 0x5104;
 const TAG_ELEMENTS_STATE_PUBLIC_OUTPUT: u16 = 0x5203;
@@ -33,14 +31,22 @@ pub struct EthereumDepositClaim {
     pub manifest_id: Hash32,
     pub prior_state: MintControllerState,
     pub finality: EthereumFinalityWitness,
-    /// Authenticated from the BIP301 mainchain parent used by block validation.
-    pub authenticated_bmm_parent_mtp: u64,
     pub deposits: Vec<VaultDeposit>,
 }
 
 impl EthereumDepositClaim {
     pub fn claim_id(&self) -> Hash32 {
         domain_hash(Domain::EthereumStateClaim, &self.encode())
+    }
+
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.manifest_id == Hash32::ZERO {
+            return Err(DecodeError::InvalidValue("zero manifest ID"));
+        }
+        self.prior_state.validate()?;
+        self.finality.validate()?;
+        MintBatch::from_deposits(&self.deposits)?;
+        Ok(())
     }
 }
 
@@ -50,7 +56,6 @@ impl CanonicalEncode for EthereumDepositClaim {
         self.manifest_id.encode_to(out);
         self.prior_state.encode_to(out);
         self.finality.encode_to(out);
-        self.authenticated_bmm_parent_mtp.encode_to(out);
         let count = u8::try_from(self.deposits.len()).expect("deposit count fits u8");
         count.encode_to(out);
         for deposit in &self.deposits {
@@ -65,7 +70,6 @@ impl CanonicalDecode for EthereumDepositClaim {
         let manifest_id = Hash32::decode_from(decoder)?;
         let prior_state = MintControllerState::decode_from(decoder)?;
         let finality = EthereumFinalityWitness::decode_from(decoder)?;
-        let authenticated_bmm_parent_mtp = decoder.u64()?;
         let count = decoder.u8()? as usize;
         if count == 0 || count > MAX_MINT_BATCH_SIZE {
             return Err(DecodeError::InvalidValue(
@@ -76,13 +80,14 @@ impl CanonicalDecode for EthereumDepositClaim {
         for _ in 0..count {
             deposits.push(VaultDeposit::decode_from(decoder)?);
         }
-        Ok(Self {
+        let value = Self {
             manifest_id,
             prior_state,
             finality,
-            authenticated_bmm_parent_mtp,
             deposits,
-        })
+        };
+        value.validate()?;
+        Ok(value)
     }
 }
 
@@ -91,12 +96,20 @@ pub struct EthereumHeartbeatClaim {
     pub manifest_id: Hash32,
     pub prior_state: MintControllerState,
     pub finality: EthereumFinalityWitness,
-    pub authenticated_bmm_parent_mtp: u64,
 }
 
 impl EthereumHeartbeatClaim {
     pub fn claim_id(&self) -> Hash32 {
         domain_hash(Domain::EthereumStateClaim, &self.encode())
+    }
+
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.manifest_id == Hash32::ZERO {
+            return Err(DecodeError::InvalidValue("zero manifest ID"));
+        }
+        self.prior_state.validate()?;
+        self.finality.validate()?;
+        Ok(())
     }
 }
 
@@ -106,52 +119,19 @@ impl CanonicalEncode for EthereumHeartbeatClaim {
         self.manifest_id.encode_to(out);
         self.prior_state.encode_to(out);
         self.finality.encode_to(out);
-        self.authenticated_bmm_parent_mtp.encode_to(out);
     }
 }
 
 impl CanonicalDecode for EthereumHeartbeatClaim {
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_header(decoder, TAG_ETHEREUM_HEARTBEAT_CLAIM)?;
-        Ok(Self {
+        let value = Self {
             manifest_id: Hash32::decode_from(decoder)?,
             prior_state: MintControllerState::decode_from(decoder)?,
             finality: EthereumFinalityWitness::decode_from(decoder)?,
-            authenticated_bmm_parent_mtp: decoder.u64()?,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ElementsBurnClaim {
-    pub manifest_id: Hash32,
-    pub burn: Burn,
-    pub event: ElementsEvent,
-}
-
-impl ElementsBurnClaim {
-    pub fn claim_id(&self) -> Hash32 {
-        domain_hash(Domain::ElementsEventClaim, &self.encode())
-    }
-}
-
-impl CanonicalEncode for ElementsBurnClaim {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        encode_header(TAG_ELEMENTS_BURN_CLAIM, out);
-        self.manifest_id.encode_to(out);
-        self.burn.encode_to(out);
-        self.event.encode_to(out);
-    }
-}
-
-impl CanonicalDecode for ElementsBurnClaim {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_header(decoder, TAG_ELEMENTS_BURN_CLAIM)?;
-        Ok(Self {
-            manifest_id: Hash32::decode_from(decoder)?,
-            burn: Burn::decode_from(decoder)?,
-            event: ElementsEvent::decode_from(decoder)?,
-        })
+        };
+        value.validate()?;
+        Ok(value)
     }
 }
 
@@ -219,7 +199,7 @@ impl CanonicalDecode for ElementsStateTransitionClaim {
         let prior_state = SolidityElementsBridgeState::decode_from(decoder)?;
         let next_state = SolidityElementsBridgeState::decode_from(decoder)?;
         let count = decoder.u8()? as usize;
-        if count > 64 {
+        if count > MAX_BURN_APPENDS_PER_STATE_TRANSITION {
             return Err(DecodeError::InvalidValue(
                 "too many burns in state transition",
             ));
@@ -244,12 +224,65 @@ pub struct DepositPublicOutput {
     pub claim_id: Hash32,
     pub prior_state: MintControllerState,
     pub next_state: MintControllerState,
+    /// Timestamp authenticated by the finalized Ethereum execution header.
+    /// The Elements controller compares this with its own BMM-parent MTP jet.
+    pub finalized_execution_block_timestamp: u64,
     pub mint_batch: MintBatch,
 }
 
 impl DepositPublicOutput {
     pub fn output_id(&self) -> Hash32 {
         domain_hash(Domain::DepositPublicOutput, &self.encode())
+    }
+
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.manifest_id == Hash32::ZERO
+            || self.claim_id == Hash32::ZERO
+            || self.finalized_execution_block_timestamp == 0
+        {
+            return Err(DecodeError::InvalidValue("invalid deposit public output"));
+        }
+        self.prior_state.validate()?;
+        self.next_state.validate()?;
+        self.mint_batch.validate()?;
+        let expected_total = self
+            .prior_state
+            .total_minted_usdd_base
+            .checked_add(self.mint_batch.total_usdd_amount_base)
+            .ok_or(DecodeError::InvalidValue("minted supply overflow"))?;
+        if self.next_state.version != self.prior_state.version
+            || self.next_state.sequence
+                != self
+                    .prior_state
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(DecodeError::InvalidValue("controller sequence overflow"))?
+            || self.next_state.next_mint_nonce != self.mint_batch.next_nonce
+            || self.mint_batch.first_nonce != self.prior_state.next_mint_nonce
+            || self.next_state.total_minted_usdd_base != expected_total
+            || self.next_state.configuration_hash != self.prior_state.configuration_hash
+            || self.next_state.finalized_beacon_slot < self.prior_state.finalized_beacon_slot
+            || self
+                .next_state
+                .finalized_beacon_slot
+                .saturating_sub(self.prior_state.finalized_beacon_slot)
+                > usdd_core::MAX_ETHEREUM_FINALITY_SLOT_GAP
+            || (self.next_state.finalized_beacon_slot == self.prior_state.finalized_beacon_slot
+                && (self.next_state.ethereum_light_client_digest
+                    != self.prior_state.ethereum_light_client_digest
+                    || self.next_state.finalized_beacon_root
+                        != self.prior_state.finalized_beacon_root
+                    || self.next_state.finalized_execution_state_root
+                        != self.prior_state.finalized_execution_state_root))
+            || (self.next_state.finalized_beacon_slot > self.prior_state.finalized_beacon_slot
+                && self.next_state.ethereum_light_client_digest
+                    == self.prior_state.ethereum_light_client_digest)
+        {
+            return Err(DecodeError::InvalidValue(
+                "deposit output does not bind the controller transition",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -260,6 +293,7 @@ impl CanonicalEncode for DepositPublicOutput {
         self.claim_id.encode_to(out);
         self.prior_state.encode_to(out);
         self.next_state.encode_to(out);
+        self.finalized_execution_block_timestamp.encode_to(out);
         self.mint_batch.encode_to(out);
     }
 }
@@ -267,13 +301,16 @@ impl CanonicalEncode for DepositPublicOutput {
 impl CanonicalDecode for DepositPublicOutput {
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_header(decoder, TAG_DEPOSIT_PUBLIC_OUTPUT)?;
-        Ok(Self {
+        let value = Self {
             manifest_id: Hash32::decode_from(decoder)?,
             claim_id: Hash32::decode_from(decoder)?,
             prior_state: MintControllerState::decode_from(decoder)?,
             next_state: MintControllerState::decode_from(decoder)?,
+            finalized_execution_block_timestamp: decoder.u64()?,
             mint_batch: MintBatch::decode_from(decoder)?,
-        })
+        };
+        value.validate()?;
+        Ok(value)
     }
 }
 
@@ -283,6 +320,45 @@ pub struct HeartbeatPublicOutput {
     pub claim_id: Hash32,
     pub prior_state: MintControllerState,
     pub next_state: MintControllerState,
+    /// Timestamp authenticated by the finalized Ethereum execution header.
+    pub finalized_execution_block_timestamp: u64,
+}
+
+impl HeartbeatPublicOutput {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.manifest_id == Hash32::ZERO
+            || self.claim_id == Hash32::ZERO
+            || self.finalized_execution_block_timestamp == 0
+        {
+            return Err(DecodeError::InvalidValue("invalid heartbeat public output"));
+        }
+        self.prior_state.validate()?;
+        self.next_state.validate()?;
+        if self.next_state.version != self.prior_state.version
+            || self.next_state.sequence
+                != self
+                    .prior_state
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(DecodeError::InvalidValue("controller sequence overflow"))?
+            || self.next_state.next_mint_nonce != self.prior_state.next_mint_nonce
+            || self.next_state.total_minted_usdd_base != self.prior_state.total_minted_usdd_base
+            || self.next_state.configuration_hash != self.prior_state.configuration_hash
+            || self.next_state.finalized_beacon_slot <= self.prior_state.finalized_beacon_slot
+            || self.next_state.ethereum_light_client_digest
+                == self.prior_state.ethereum_light_client_digest
+            || self
+                .next_state
+                .finalized_beacon_slot
+                .saturating_sub(self.prior_state.finalized_beacon_slot)
+                > usdd_core::MAX_ETHEREUM_FINALITY_SLOT_GAP
+        {
+            return Err(DecodeError::InvalidValue(
+                "heartbeat output does not bind a state-only transition",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CanonicalEncode for HeartbeatPublicOutput {
@@ -292,63 +368,22 @@ impl CanonicalEncode for HeartbeatPublicOutput {
         self.claim_id.encode_to(out);
         self.prior_state.encode_to(out);
         self.next_state.encode_to(out);
+        self.finalized_execution_block_timestamp.encode_to(out);
     }
 }
 
 impl CanonicalDecode for HeartbeatPublicOutput {
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_header(decoder, TAG_HEARTBEAT_PUBLIC_OUTPUT)?;
-        Ok(Self {
+        let value = Self {
             manifest_id: Hash32::decode_from(decoder)?,
             claim_id: Hash32::decode_from(decoder)?,
             prior_state: MintControllerState::decode_from(decoder)?,
             next_state: MintControllerState::decode_from(decoder)?,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RedemptionPublicOutput {
-    pub manifest_id: Hash32,
-    pub claim_id: Hash32,
-    pub redemption_id: Hash32,
-    pub burn: Burn,
-    pub elements_block_hash: Hash32,
-    pub bitcoin_bmm_block_hash: Hash32,
-    pub bitcoin_confirmations: u32,
-}
-
-impl RedemptionPublicOutput {
-    pub fn output_id(&self) -> Hash32 {
-        domain_hash(Domain::RedemptionPublicOutput, &self.encode())
-    }
-}
-
-impl CanonicalEncode for RedemptionPublicOutput {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        encode_header(TAG_REDEMPTION_PUBLIC_OUTPUT, out);
-        self.manifest_id.encode_to(out);
-        self.claim_id.encode_to(out);
-        self.redemption_id.encode_to(out);
-        self.burn.encode_to(out);
-        self.elements_block_hash.encode_to(out);
-        self.bitcoin_bmm_block_hash.encode_to(out);
-        self.bitcoin_confirmations.encode_to(out);
-    }
-}
-
-impl CanonicalDecode for RedemptionPublicOutput {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_header(decoder, TAG_REDEMPTION_PUBLIC_OUTPUT)?;
-        Ok(Self {
-            manifest_id: Hash32::decode_from(decoder)?,
-            claim_id: Hash32::decode_from(decoder)?,
-            redemption_id: Hash32::decode_from(decoder)?,
-            burn: Burn::decode_from(decoder)?,
-            elements_block_hash: Hash32::decode_from(decoder)?,
-            bitcoin_bmm_block_hash: Hash32::decode_from(decoder)?,
-            bitcoin_confirmations: decoder.u32()?,
-        })
+            finalized_execution_block_timestamp: decoder.u64()?,
+        };
+        value.validate()?;
+        Ok(value)
     }
 }
 
@@ -379,7 +414,7 @@ impl CanonicalEncode for ElementsStatePublicOutput {
 impl CanonicalDecode for ElementsStatePublicOutput {
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_header(decoder, TAG_ELEMENTS_STATE_PUBLIC_OUTPUT)?;
-        Ok(Self {
+        let value = Self {
             manifest_id: Hash32::decode_from(decoder)?,
             claim_id: Hash32::decode_from(decoder)?,
             prior_bridge_state_hash: Hash32::decode_from(decoder)?,
@@ -387,6 +422,18 @@ impl CanonicalDecode for ElementsStatePublicOutput {
             verifier_statement: Hash32::decode_from(decoder)?,
             prior_state: SolidityElementsBridgeState::decode_from(decoder)?,
             next_state: SolidityElementsBridgeState::decode_from(decoder)?,
-        })
+        };
+        if value.manifest_id == Hash32::ZERO
+            || value.claim_id == Hash32::ZERO
+            || value.next_bridge_state_hash == Hash32::ZERO
+            || value.verifier_statement == Hash32::ZERO
+            || value.prior_state.is_zero() != (value.prior_bridge_state_hash == Hash32::ZERO)
+        {
+            return Err(DecodeError::InvalidValue(
+                "invalid Elements state public output",
+            ));
+        }
+        value.prior_state.validate_successor(&value.next_state)?;
+        Ok(value)
     }
 }

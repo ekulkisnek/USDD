@@ -1,86 +1,140 @@
 # Inventory-only Elements HTLC V1
 
-Status: fail-closed design artifact; not compiled or deployable.
+Status: source-only, syntax-testable, and **not deployable**. No compiled
+program, CMR, control block, or address is canonical yet.
 
-This HTLC swaps already existing inventory. Its intended V1 use is an
-independent swap between native Elements USDD and Tron USDT. It is not part of
-the canonical Ethereum vault, cannot mint or reissue USDD, cannot redeem the
-Ethereum reserve, and does not make Tron a canonical rail.
+This HTLC swaps already-existing Elements inventory. Its intended V1 use is an
+independent swap between native Elements USDD and USDT on an external chain.
+It is not part of the canonical Ethereum vault, cannot issue or reissue USDD,
+cannot redeem the Ethereum reserve, and does not verify Tron or Ethereum.
 
-## Immutable parameters
+## Committed source parameters
 
-One HTLC instance commits:
+Each rendered SimplicityHL program commits these values as source constants:
 
 ```
-version                    u32 = 1
 secretHash                 bytes32 = SHA256(secret[32])
-claimantScriptHash         bytes32
-refundScriptHash           bytes32
-assetId                    bytes32
-amount                     u64, positive
-elementsRefundDeadline     u32 absolute locktime
-externalRefundDeadline     u64
+claimantXOnlyPubkey        valid, nonzero secp256k1 x coordinate
+refundXOnlyPubkey          valid, nonzero secp256k1 x coordinate
+elementsRefundTimestamp   u32 absolute timestamp, at least 500,000,000
 ```
 
-The secret is exactly 32 bytes. All hash/script/asset commitments are nonzero;
-claimant and refund scripts are fixed and distinct. `externalRefundDeadline`
-must be at least 86,400 seconds later than the Elements deadline. Deployments
-must add a larger measured margin if either chain's finality and relay latency
-requires it; 24 hours is only the hard floor.
+The claimant and refund keys must be distinct. The separate external-chain
+HTLC must use the same SHA-256 digest and exact 32-byte preimage. Keccak,
+HASH160, text hex, padded ABI values, and variable-length secrets are different
+contracts.
 
-The external-chain HTLC must use the same SHA-256 digest and exact 32-byte
-preimage. Keccak, HASH160, text hex, padded ABI values, and variable-length
-secrets are different contracts and are rejected.
+`render_inventory_htlc.py` also requires an external refund timestamp. That
+timestamp is metadata for validating swap construction; it is deliberately not
+embedded in or observed by the Elements program. The renderer requires:
+
+```
+externalRefundTimestamp >= elementsRefundTimestamp + 86,400 seconds
+```
+
+Thus the Elements refund is strictly earlier. Twenty-four hours is a hard
+minimum, not an operational recommendation; deployments must use a larger
+measured margin when either chain's finality or relay latency requires it.
 
 ## Claim branch
 
-Before the Elements refund path becomes valid, anyone may provide the exact
-32-byte preimage. The Simplicity policy verifies `SHA256(secret) == secretHash`
-and forces an explicit output of exactly `assetId` and `amount` to the immutable
-claimant script. Permissionless execution is safe because the executor cannot
-change the destination or amount.
+The claimant provides exactly one `u256` witness, which encodes a 32-byte
+preimage, and one BIP340 signature. The program computes SHA-256 over those 32
+bytes, compares it with the fixed secret hash, and verifies the signature from
+the fixed claimant x-only key over Elements' `sig_all_hash`.
+
+The signature commits the spending transaction, including its outputs. Merely
+learning the preimage is therefore insufficient to redirect the inventory.
+The claimant must sign the exact transaction it intends to publish.
 
 ## Refund branch
 
-At or after `elementsRefundDeadline`, anyone may execute the refund branch. It
-enforces the absolute Elements locktime/sequence rule and forces an explicit
-output of exactly `assetId` and `amount` to the immutable refund script. No
-secret is accepted as a substitute after selecting this branch.
+The refund party provides one BIP340 signature from the fixed refund x-only
+key over `sig_all_hash`. The program additionally calls
+`check_lock_time(Time(elementsRefundTimestamp))`. The spending transaction
+must use timestamp-form absolute `nLockTime` at or after the fixed deadline and
+must have the non-final input sequence required for locktime enforcement.
 
-The Elements claimant reveals the secret while claiming Elements first. The
-counterparty learns it from Elements and then has at least the configured gap
-to claim the external-chain inventory before the later external refund.
-Transaction construction must not reverse this ordering.
+Like a conventional CLTV-style HTLC, the claim branch does not become invalid
+at the refund timestamp. After that timestamp, a valid claim and a valid refund
+can race. The refund party must remain available, or use non-custodial
+automation, to publish and confirm its pre-signed refund promptly. This is a
+liveness requirement on the swap participants, not a trusted authorization
+role.
 
-## Transaction restrictions
+## Atomic-swap ordering
 
-Both branches enforce:
+The party holding the preimage claims the Elements inventory before its earlier
+refund timestamp. Publication reveals the exact 32-byte preimage. The
+counterparty then claims the external-chain inventory before that chain's later
+refund timestamp. Reversing the deadlines creates a theft window and is
+rejected by the renderer.
 
-- the HTLC input asset and amount equal the immutable values;
-- the protected asset amount goes to exactly one fixed branch output;
-- no input or output issues, reissues, or burns any asset;
-- fees are paid from separate policy-asset inputs and cannot reduce the HTLC
-  amount;
-- no confidential asset/value is used for the protected input or output; and
-- additional inputs/outputs cannot create an alternative path for the protected
-  asset or alter the claimant/refund scripts.
+The 24-hour ordering window limits the time for the external claim; it does not
+make an offline refund party safe forever. If the Elements refund is not
+confirmed before the external refund and the external side is refunded, the
+still-valid Elements claim branch could be used later. Production operation
+therefore needs reliable chain monitoring and pre-signed refunds. Monitoring
+may be performed by anyone and holds no key, but the refund signature must be
+prepared by the fixed refund participant.
 
-An implementation may choose a stricter exact transaction template. It may not
-relax asset/amount conservation or introduce a signer, watcher, admin, or
-controller dependency.
+Both transactions must be fully prepared and checked before either asset is
+funded. A party must not accept a funding output based only on a source file;
+it must verify the final program encoding, CMR, Taproot commitment, keys, hash,
+asset, amount, and both chain deadlines.
 
-## Tests required for the compiled program
+## Scope and limitations
 
-- correct and wrong 32-byte preimages; 31/33-byte and alternate-hash preimages;
-- claim just before/at/after the Elements deadline;
-- refund just before/at/after the Elements deadline;
+The Simplicity program has no issuance, reissuance, burn, bridge, oracle,
+proof-verifier, watcher, administrator, or fee path. The locked asset and
+amount come from the funded Elements UTXO, while each participant's
+`sig_all_hash` signature authorizes the complete branch transaction. Consensus
+still enforces ordinary Elements asset conservation.
+
+The program does not inspect every unrelated input for issuance and does not
+force a particular destination script in Simplicity. A signer can authorize
+additional transaction activity or any destination by signing it. Production
+swap tooling should construct a minimal transaction and display every input,
+output, asset, value, fee, issuance, and burn before requesting the signature.
+
+## Reproducible source check
+
+Render to standard output and syntax-check against the pinned official
+SimplicityHL checkout:
+
+```sh
+python3 simplicity/render_inventory_htlc.py \
+  --secret-hash <64-hex-character-sha256> \
+  --claimant-xonly-pubkey <64-hex-character-key> \
+  --refund-xonly-pubkey <64-hex-character-key> \
+  --elements-refund-timestamp <u32-unix-time> \
+  --external-refund-timestamp <later-u64-unix-time> \
+  --check-with-simplicityhl /Volumes/T705/space-relief/research/simplicityhl-main
+```
+
+The syntax check is pinned to official SimplicityHL commit
+`f62adf11e16816dd8f33f16edb5ff9f4c4b45e36`, package version `0.6.0`, which
+depends on `simplicity-lang 0.8.0` and `simplicity-sys 0.7.0`. The compiled
+bytes are discarded on purpose.
+
+The Elements fork vendors a separately generated C Simplicity subtree and is
+also receiving a new network-specific environment jet. This repository has not
+yet demonstrated, byte for byte, that a program emitted by that Rust compiler
+decodes to the same jets, CMR, types, and costs in the exact Elements node.
+Consequently no encoded program or CMR is recorded here. That compatibility
+must be proven by decoding, typechecking, CMR comparison, and execution in the
+node's vendored C implementation before an artifact can be called deployable.
+
+## Required transaction-level tests before deployment
+
+- correct and wrong 32-byte preimages and a signature from the wrong key;
+- mutation of every `sig_all_hash`-committed transaction field;
+- claim succeeds before, at, and after the Elements deadline;
+- refund fails before and succeeds at/after the Elements deadline;
+- final and non-final input sequences and height-form versus time-form locktime;
 - external deadline gaps of 86,399 and 86,400 seconds;
-- wrong asset, amount, claimant/refund script, confidential value, and fee
-  subtraction;
-- every issuance, reissuance, and OP_RETURN/burn attempt;
-- non-final input sequence and wrong locktime units; and
-- same-secret end-to-end vectors in the external HTLC implementation.
+- wrong asset, amount, CMR, claimant key, refund key, and secret hash; and
+- same-secret end-to-end vectors for each external HTLC implementation.
 
-`usdd_formats.py` and `test_usdd_formats.py` cover parameter-level bounds. They
-do not substitute for executing a compiled Simplicity program against real
-Elements transactions.
+`test_inventory_htlc.py` covers source rendering, key validity, hash width, and
+deadline bounds. It does not substitute for transaction-level node execution.

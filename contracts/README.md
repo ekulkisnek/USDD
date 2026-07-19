@@ -20,7 +20,7 @@ npm test
 
 The custom runner compiles with Solidity 0.8.30 and executes the Solidity suites on an isolated local EVM. Each ordinary test runs against an EVM snapshot; the three-stage deadline test advances local time explicitly.
 
-The tests cover canonical deposit commitments, per-deposit and aggregate caps, exact token deltas, legacy no-return tokens, fee/false-return rejection, state sequencing, verifier code-hash pinning, burn-index bounds, 64-level proofs, recipient binding, replay, insolvency, HTLC deadline ordering, permissionless execution, claim/refund exclusivity, and locked donations.
+The tests cover canonical deposit commitments, per-deposit and aggregate caps, exact token deltas, legacy no-return tokens, fee/false-return rejection, state sequencing, nonzero Elements consensus-state commitments, canonical empty burn roots, bounded burn growth, verifier code-hash pinning, burn-index bounds, 64-level proofs, recipient binding, replay, insolvency, HTLC deadline ordering and endpoint validation, permissionless execution, claim/refund exclusivity, and locked donations.
 
 ## Reproducible build and deployment freeze
 
@@ -28,10 +28,28 @@ The tests cover canonical deposit commitments, per-deposit and aggregate caps, e
 
 ```sh
 npm run build
-node scripts/freeze-deployment.mjs <rpc-url> <vault-address> [direct-deployment-tx-hash]
+node scripts/freeze-deployment.mjs <rpc-url> <vault-address> <direct-deployment-tx-hash> <verifier-preflight-json>
 ```
 
-The build pins stock solc 0.8.30, optimizer runs 200, Shanghai EVM output, and metadata settings. The deployment freezer checks every non-immutable runtime byte, records the actual immutable-patched code hash, reads every immutable vault getter, independently queries the verifier's program/config identity getters, validates the verifier code hash and recomputed vault ID, confirms pristine protocol storage, and—when given a direct deployment transaction—decodes and compares all constructor arguments.
+The build pins stock solc 0.8.30, optimizer runs 200, Shanghai EVM output, and metadata settings. The deployment freezer requires the direct deployment transaction, checks every non-immutable runtime byte, records the actual immutable-patched code hash, reads every immutable vault getter, independently queries the verifier's program/config identity getters, validates the verifier code hash and recomputed vault ID, confirms pristine protocol storage, and decodes and compares all constructor arguments. Factory deployments require separate authenticated creation-trace tooling and are not accepted by this freezer.
+
+The verifier preflight is also mandatory. It rejects the checked-in `MockRawProofVerifier` under every immutable constructor identity, runtime storage access, `CALL`, `CALLCODE`, `DELEGATECALL`, contract creation, `SELFDESTRUCT`, and every `STATICCALL`, `EXTCODE*`, or `BALANCE` occurrence. It also verifies that the runtime matches a SHA-256-pinned compiler artifact with an empty storage layout. Version 2 intentionally has no documentation-only exception: free-form prose cannot prove that an external target is fixed. A future verifier that needs an EVM precompile remains blocked until the preflight implements and audits machine-verifiable target/code-identity extraction. This scan still does **not** prove verifier correctness or replace source review and adversarial testing.
+
+The preflight JSON has schema `usdd-verifier-runtime-preflight-v2`, binds the deployed runtime code hash, and identifies a SHA-256-pinned compiler artifact. `storageLayoutJsonPath` and `runtimeBytecodeJsonPath` are arrays of JSON object keys locating the compiler's storage-layout and deployed-bytecode records. `documentedExternalDependencies` must be an empty array:
+
+```json
+{
+  "schema": "usdd-verifier-runtime-preflight-v2",
+  "runtimeCodeKeccak256": "0x...",
+  "compilerArtifact": {
+    "path": "./verifier-solc-output.json",
+    "sha256": "0x...",
+    "storageLayoutJsonPath": ["contracts", "Verifier.sol", "Verifier", "storageLayout"],
+    "runtimeBytecodeJsonPath": ["contracts", "Verifier.sol", "Verifier", "evm", "deployedBytecode"]
+  },
+  "documentedExternalDependencies": []
+}
+```
 
 ## Scope boundary
 

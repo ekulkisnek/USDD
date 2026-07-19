@@ -12,16 +12,14 @@ pub use annex::{
     SP1_ANNEX_TAG, SP1_PUBLIC_VALUES_MAX_SIZE,
 };
 pub use claims::{
-    BurnAppend, DepositPublicOutput, ElementsBurnClaim, ElementsStatePublicOutput,
-    ElementsStateTransitionClaim, EthereumDepositClaim, EthereumHeartbeatClaim,
-    HeartbeatPublicOutput, RedemptionPublicOutput,
+    BurnAppend, DepositPublicOutput, ElementsStatePublicOutput, ElementsStateTransitionClaim,
+    EthereumDepositClaim, EthereumHeartbeatClaim, HeartbeatPublicOutput,
 };
 pub use guest::{
     build_deposit_journal, build_elements_state_journal, build_heartbeat_journal,
-    build_redemption_journal, ElementsValidityProofVerifier, EthereumStateProofVerifier,
-    GuestError, VerificationError,
+    ElementsValidityProofVerifier, EthereumStateProofVerifier, GuestError, VerificationError,
 };
 pub use journal::{
-    DigestAlgorithm, JournalError, StatementKind, StrictJournal, JOURNAL_MAGIC,
+    DigestAlgorithm, JournalError, StatementKind, StrictJournal, TypedPublicValues, JOURNAL_MAGIC,
     JOURNAL_SUCCESS_MARKER,
 };

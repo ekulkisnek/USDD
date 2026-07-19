@@ -1,0 +1,44 @@
+[package]
+name = "usdd-ethereum-inbound"
+version.workspace = true
+edition = "2024"
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+description = "Fail-closed Ethereum finality/MPT composition core for USDD inbound proofs"
+
+[features]
+default = ["std", "helios-finality"]
+std = [
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "alloy-trie/std",
+    "usdd-core/std",
+    "usdd-proof-core/std",
+]
+helios-finality = [
+    "std",
+    "dep:alloy-tx-macros",
+    "dep:helios-consensus-core",
+    "dep:serde",
+    "dep:serde_cbor",
+    "dep:tree_hash",
+]
+
+[dependencies]
+# These are the exact MPT dependencies locked by the audited SP1-Helios v1.2.0
+# reference revision 07096e1955bce67546fb9b185772296d41ef0eaa. SP1-Helios
+# itself uses SP1 6.2.4, so it is a reference only and is not linked here.
+alloy-primitives = { version = "=1.3.1", default-features = false, features = ["rlp", "sha3-keccak"] }
+alloy-rlp = { version = "=0.3.12", default-features = false }
+alloy-trie = { version = "=0.9.1", default-features = false, features = ["ethereum"] }
+usdd-core = { path = "../usdd-core", default-features = false }
+usdd-proof-core = { path = "../usdd-proof-core", default-features = false }
+helios-consensus-core = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924", optional = true }
+# Helios 0.11.1's semver range otherwise admits an incompatible 1.8 derive
+# macro alongside alloy-consensus 1.0.41. Keep the audited dependency family
+# coherent instead of relying on a mutable registry resolution.
+alloy-tx-macros = { version = "=1.0.41", optional = true }
+serde = { version = "=1.0.228", features = ["derive"], optional = true }
+serde_cbor = { version = "=0.11.2", optional = true }
+tree_hash = { version = "=0.10.0", optional = true }

@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/usdd-core",
     "crates/usdd-proof-core",
+    "crates/usdd-bitcoin-bmm",
+    "crates/usdd-ethereum-inbound",
+    "crates/usdd-sp1-verifier",
     "crates/usdd-cli",
 ]
 

@@ -13,20 +13,29 @@ controller_v1 := FAIL_CLOSED
  * current = committed_controller_state()
  * require(current.version == 1)
  * require(current.configHash == IMMUTABLE_CONFIG_HASH)
- * require(authenticated_bmm_parent_mtp_is_present())
+ * currentBmmParentMtp = current_bmm_parent_mtp_from_elements_environment()
+ * require(currentBmmParentMtp.isPresent)
  *
- * annex = bounded_owned_current_annex(max = 512 KiB)
- * require(annex_hash_matches_transaction(annex))
- * envelope = parse_usdd_sp1_v1(annex)
- * require(envelope.statementKind == ETH_STATE_V1)
- * require(envelope.guestVkeyHash == ETHEREUM_GUEST_VKEY_HASH)
- * journal = verify_sp1_compressed_v1(envelope)
+ * journal = typed_public_values_from_simplicity_witness()
+ * journalBytes = canonical_encode_eth_state_v1(journal)
+ * publicValuesHash = sha256(journalBytes)
+ * require(verify_sp1_compressed_sha256(
+ *   ETHEREUM_GUEST_PROGRAM_ID,
+ *   publicValuesHash
+ * ))
+ * require(journal.hasNoBmmParentMtpField)
+ * require(checked_abs_diff(
+ *   currentBmmParentMtp.value,
+ *   journal.provedExecutionBlockTimestamp
+ * ) <= 21600)
  *
  * require(journal.priorState == current)
  * if journal.isMint:
  *   require(1 <= journal.depositCount && journal.depositCount <= 64)
  *   require(deposits_are_consecutive_from(journal, current.nextMintNonce))
  *   require(all_amounts_use_checked_usdt6_times_100(journal))
+ *   require(each_deposit_usdt6 <= 20_000_000e6)
+ *   require(batch_total_usdd8 <= 2_000_000_000_000_000)
  *   require(exact_native_usdd_reissuance_and_recipient_outputs(journal))
  * else if journal.isHeartbeat:
  *   require(journal.depositCount == 0)
@@ -40,6 +49,9 @@ controller_v1 := FAIL_CLOSED
  * succeed
  *
  * The SP1 verifier requires an upstream jet specification/CMR/generated
- * dispatch/type/cost/activation. Raw proof bytes require bounded txEnv ownership
- * and annex-hash binding. Neither exists in the current released code.
+ * dispatch/type/cost/activation. It reads the bounded exact annex internally;
+ * a generic annex-byte jet is deliberately not part of V1. Authenticated parent
+ * MTP is exposed by generated decoder item 51; the future controller toolchain
+ * must reproduce its fixed CMR and cost before this template can be replaced by
+ * deployable code.
  */

@@ -17,6 +17,10 @@ const productionSources = [
   "src/libraries/ExactSafeERC20.sol",
   "src/libraries/Sha256SparseMerkle.sol"
 ].sort();
+const blockedVerifierSources = [
+  "src/interfaces/IRawProofVerifier.sol",
+  "src/mocks/MockRawProofVerifier.sol"
+].sort();
 
 const compilerSettings = {
   optimizer: { enabled: true, runs: 200 },
@@ -66,23 +70,23 @@ function bytecodeRecord(object, extra = {}) {
   };
 }
 
-function sourceInput() {
+function sourceInput(sourceNames = productionSources) {
   return Object.fromEntries(
-    productionSources.map((sourceName) => [
+    sourceNames.map((sourceName) => [
       sourceName,
       { content: fs.readFileSync(path.join(root, sourceName), "utf8") }
     ])
   );
 }
 
-function compile() {
+function compile(sourceNames = productionSources) {
   if (solc.version() !== expectedCompiler) {
     throw new Error(`Wrong solc: expected ${expectedCompiler}, received ${solc.version()}`);
   }
 
   const input = {
     language: "Solidity",
-    sources: sourceInput(),
+    sources: sourceInput(sourceNames),
     settings: {
       ...compilerSettings,
       outputSelection: {
@@ -132,14 +136,17 @@ function contractRecord(artifact) {
 
 function buildFiles() {
   const { input, output } = compile();
+  const blockedVerifierBuild = compile(blockedVerifierSources);
   const standardInputText = serialized(input);
   const vault = contractRecord(output.contracts["src/USDDVaultV1.sol"].USDDVaultV1);
   const htlc = contractRecord(output.contracts["src/USDTHTLC.sol"].USDTHTLC);
+  const mockVerifier = blockedVerifierBuild.output.contracts["src/mocks/MockRawProofVerifier.sol"].MockRawProofVerifier;
+  const mockVerifierRuntime = mockVerifier.evm.deployedBytecode;
   const depositMapping = vault.storageLayout.storage.find(
     (entry) => entry.label === "depositCommitmentByNonce"
   );
-  if (!depositMapping || depositMapping.slot !== "11") {
-    throw new Error(`depositCommitmentByNonce moved from frozen slot 11 to ${depositMapping?.slot ?? "missing"}`);
+  if (!depositMapping || depositMapping.slot !== "12") {
+    throw new Error(`depositCommitmentByNonce moved from frozen slot 12 to ${depositMapping?.slot ?? "missing"}`);
   }
 
   const sourceHashes = Object.fromEntries(
@@ -163,11 +170,28 @@ function buildFiles() {
     sourceHashes,
     protocolStorage: {
       depositCommitmentByNonce: {
-        slot: 11,
-        solidityKeyExpression: "keccak256(abi.encode(uint64(nonce), uint256(11)))",
+        slot: 12,
+        solidityKeyExpression: "keccak256(abi.encode(uint64(nonce), uint256(12)))",
         valueEncoding: "bytes32 depositId"
       }
     },
+    blockedVerifierFingerprints: [
+      {
+        name: "MockRawProofVerifier",
+        source: "src/mocks/MockRawProofVerifier.sol",
+        reason: "Test-only exact-statement matcher; it proves no chain state and must never authorize a vault.",
+        sourceHashes: Object.fromEntries(
+          blockedVerifierSources.map((sourceName) => {
+            const bytes = Buffer.from(blockedVerifierBuild.input.sources[sourceName].content, "utf8");
+            return [sourceName, hashes(bytes)];
+          })
+        ),
+        runtimeBytecodeTemplate: bytecodeRecord(mockVerifierRuntime.object, {
+          immutableReferences: mockVerifierRuntime.immutableReferences,
+          note: "Immutable ranges are ignored when matching a deployed runtime, so every constructor identity is denied."
+        })
+      }
+    ],
     contracts: {
       USDDVaultV1: {
         source: "src/USDDVaultV1.sol",

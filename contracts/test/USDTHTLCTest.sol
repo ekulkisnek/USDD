@@ -17,6 +17,25 @@ contract PermissionlessExecutor {
     }
 }
 
+contract HTLCSelfEndpointFactory {
+    function deployWithSelfClaim(MockUSDT token, uint256 amount, bytes32 secretHash) external {
+        // A new contract's first CREATE uses nonce 1. The child address is
+        // independent of initcode, so it can be supplied as an endpoint.
+        address child = address(uint160(uint256(keccak256(abi.encodePacked(hex"d694", address(this), hex"01")))));
+        uint32 elementsDeadline = uint32(block.timestamp + 1 days);
+        new USDTHTLC(
+            address(token),
+            address(this),
+            child,
+            address(0xCAFE),
+            amount,
+            secretHash,
+            elementsDeadline,
+            uint64(elementsDeadline) + uint64(24 hours)
+        );
+    }
+}
+
 contract USDTHTLCTest {
     uint256 private constant AMOUNT = 5_000_000;
     bytes32 private constant SECRET = bytes32(uint256(0x515253));
@@ -54,8 +73,8 @@ contract USDTHTLCTest {
 
     function testConstructorRejectsUnsafeDeadlineOrder() external {
         MockUSDT token = new MockUSDT();
-        uint64 elementsDeadline = uint64(block.timestamp + 1 days);
-        uint64 unsafeExternalDeadline = elementsDeadline + uint64(24 hours) - 1;
+        uint32 elementsDeadline = uint32(block.timestamp + 1 days);
+        uint64 unsafeExternalDeadline = uint64(elementsDeadline) + uint64(24 hours) - 1;
 
         try new USDTHTLC(
             address(token),
@@ -66,6 +85,30 @@ contract USDTHTLCTest {
             sha256(abi.encodePacked(SECRET)),
             elementsDeadline,
             unsafeExternalDeadline
+        ) returns (USDTHTLC) {
+            revert ExpectedRevert();
+        } catch {}
+    }
+
+    function testConstructorRejectsSelfEndpointAndIdenticalRecipients() external {
+        MockUSDT token = new MockUSDT();
+        HTLCSelfEndpointFactory factory = new HTLCSelfEndpointFactory();
+        bytes32 secretHash = sha256(abi.encodePacked(SECRET));
+        _expectRevert(
+            address(factory),
+            abi.encodeCall(HTLCSelfEndpointFactory.deployWithSelfClaim, (token, AMOUNT, secretHash))
+        );
+
+        uint32 elementsDeadline = uint32(block.timestamp + 1 days);
+        try new USDTHTLC(
+            address(token),
+            address(this),
+            CLAIM_RECIPIENT,
+            CLAIM_RECIPIENT,
+            AMOUNT,
+            secretHash,
+            elementsDeadline,
+            uint64(elementsDeadline) + uint64(24 hours)
         ) returns (USDTHTLC) {
             revert ExpectedRevert();
         } catch {}
@@ -101,7 +144,7 @@ contract USDTHTLCTest {
 
     function testLegacyNoReturnTokenCanFundAndClaim() external {
         MockNoReturnUSDT token = new MockNoReturnUSDT();
-        uint64 elementsDeadline = uint64(block.timestamp + 1 days);
+        uint32 elementsDeadline = uint32(block.timestamp + 1 days);
         USDTHTLC htlc = new USDTHTLC(
             address(token),
             address(this),
@@ -110,7 +153,7 @@ contract USDTHTLCTest {
             AMOUNT,
             sha256(abi.encodePacked(SECRET)),
             elementsDeadline,
-            elementsDeadline + uint64(24 hours)
+            uint64(elementsDeadline) + uint64(24 hours)
         );
         token.mint(address(this), AMOUNT);
         token.approve(address(htlc), AMOUNT);
@@ -140,8 +183,8 @@ contract USDTHTLCTest {
         if (address(timedToken) != address(0)) revert TimedScenarioAlreadyPrepared();
         timedToken = new MockUSDT();
         timedToken.mint(address(this), AMOUNT * 3);
-        uint64 elementsDeadline = uint64(block.timestamp + 100);
-        uint64 externalDeadline = elementsDeadline + uint64(24 hours);
+        uint32 elementsDeadline = uint32(block.timestamp + 100);
+        uint64 externalDeadline = uint64(elementsDeadline) + uint64(24 hours);
         bytes32 secretHash = sha256(abi.encodePacked(SECRET));
 
         timedRefundHtlc = new USDTHTLC(
@@ -202,7 +245,7 @@ contract USDTHTLCTest {
     function _standardHtlc() private returns (MockUSDT token, USDTHTLC htlc) {
         token = new MockUSDT();
         token.mint(address(this), AMOUNT);
-        uint64 elementsDeadline = uint64(block.timestamp + 1 days);
+        uint32 elementsDeadline = uint32(block.timestamp + 1 days);
         htlc = new USDTHTLC(
             address(token),
             address(this),
@@ -211,7 +254,7 @@ contract USDTHTLCTest {
             AMOUNT,
             sha256(abi.encodePacked(SECRET)),
             elementsDeadline,
-            elementsDeadline + uint64(24 hours)
+            uint64(elementsDeadline) + uint64(24 hours)
         );
         _eq(address(token), htlc.USDT());
         _eq(address(this), htlc.FUNDER());

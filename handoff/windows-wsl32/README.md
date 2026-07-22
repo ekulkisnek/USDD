@@ -85,3 +85,71 @@ bash handoff/windows-wsl32/package-result.sh
 
 Copy the resulting `.tar.gz` and `.sha256` files to the primary machine. Do not
 commit generated proof artifacts to GitHub.
+
+## 5. Wrap the verified segment proof for Ethereum
+
+After transferring and independently validating the segment archive, reboot
+Windows once if an update reboot is pending. Reopen Ubuntu, confirm the WSL
+checkout is on this branch and current, then restore the same no-sleep and
+no-automatic-restart protection used for proving. Do not start another heavy
+job during wrapping.
+
+The original successful WSL proof directory should be:
+
+```text
+/root/usdd-proof-runs/ecash-segment-20260722T204834Z/proof
+```
+
+Update and rebuild the host after pulling the wrapper-runner scripts:
+
+```bash
+cd ~/USDD
+git fetch origin
+git switch agent/windows-sp1-proof-runner
+git pull --ff-only
+bash handoff/windows-wsl32/bootstrap.sh
+```
+
+Verify the exact source proof and launch the wrapper:
+
+```bash
+python3 handoff/windows-wsl32/verify-segment-result.py \
+  /root/usdd-proof-runs/ecash-segment-20260722T204834Z/proof
+
+bash handoff/windows-wsl32/start-wrap.sh \
+  /root/usdd-proof-runs/ecash-segment-20260722T204834Z/proof
+
+bash handoff/windows-wsl32/wrap-status.sh
+```
+
+The first run downloads and extracts SP1's official v6.1.0 Groth16 circuit
+package below `~/usdd-sp1-circuits/groth16/v6.1.0`. The launcher requires 100
+GiB free before starting. It refuses an incomplete pre-existing circuit
+directory and verifies an installed `groth16_vk.bin` against the fixed
+`4388a21c687fdd5f218d7e3d13190cac4c5355818d3605fd5fb811df468ee696`
+identity. SP1 then SDK-verifies the compressed proof, shrink/wraps it, produces
+the Groth16 proof, and SDK-verifies the wrapper before any result is marked
+successful.
+
+If download or extraction fails, preserve and rename the incomplete
+`v6.1.0` circuit directory before retrying. Do not let SP1 mistake a partial
+directory for an installed circuit package.
+
+After `wrap-status.sh` reports `SUCCESS`, package the result:
+
+```bash
+bash handoff/windows-wsl32/package-wrap-result.sh
+```
+
+Return the wrapper `.tar.gz` and `.sha256` files. The package must include:
+
+- `wrap-metadata.json` with `GROTH16_WRAPPER_SDK_VERIFIED` status;
+- the 356-byte `groth16-proof.bin`;
+- the 551-byte segment public values;
+- the 907-byte `relay-proof.bin` concatenation;
+- `ethereum-verifier-arguments.json`;
+- the SP1 proof container and fixed program identities.
+
+This segment wrapper proves the Ethereum verification pipeline, but it is not
+the production relay authorization. Production still requires source segments
+covering a real finalized slot-24 M6 and one adjacent `ECASH_FOLD_V1` proof.

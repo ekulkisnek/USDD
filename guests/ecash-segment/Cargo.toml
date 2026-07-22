@@ -1,0 +1,24 @@
+[package]
+name = "usdd-ecash-segment-guest"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = { version = "=6.3.1", default-features = true }
+usdd-core = { path = "../../crates/usdd-core" }
+usdd-ecash-proof-core = { path = "../../crates/usdd-ecash-proof-core" }
+
+[patch.crates-io]
+sha2-v0-9-9 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.9.9-sp1-6.0.0" }
+sha3-v0-10-8 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha3", tag = "patch-sha3-0.10.8-sp1-6.0.0" }
+tiny-keccak = { git = "https://github.com/sp1-patches/tiny-keccak", tag = "patch-2.0.2-sp1-6.0.0" }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3

@@ -1,45 +1,133 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
-//! Narrow, deterministic primitives needed by the future outbound SP1 guest.
+//! Narrow, deterministic primitives needed by the BIP300 redemption-approval
+//! verifier.
 //!
 //! The crate validates Bitcoin headers, proof of work, cumulative work, the
 //! LayerTwo Signet difficulty rule, exact parent linkage, exact block/transaction
 //! serialization, context-free transaction structure, block weight, a
 //! non-mutated txid Merkle tree, coinbase placement, and the Elements fork's
 //! canonical slot-24 M7 encoding. It also verifies BIP141 witness commitments
-//! and the immutable LayerTwo-Labs P2WPKH Signet solution. The strongest
-//! integrated API binds the M7 through the coinbase txid and Merkle root to the
-//! Signet-authorized proof-of-work successor header. A separate bounded layer
-//! ports the local fork's slot-24 M1/M2 activation, positive-only CTIP replay,
-//! and M8 relationship.
+//! and the sole-network Elements parent-Signet P2WPKH solution. The strongest
+//! integrated genesis-derived APIs apply those checks, contextual
+//! PoW/difficulty/work/time, and either deliberately fail-closed sole-slot-24
+//! replay or source-faithful all-256-slot M1-through-M8 replay to the same exact
+//! block and branch. Slot 24 alone may consume the optional canonical USDD
+//! accumulator artifact. Opaque trackers keep an approved M6 on the selected
+//! composed branch and expose its root only after the frozen 100-confirmation
+//! depth. All-slot continuity loss halts future approvals without revoking an
+//! earlier exact approval already bound to that branch.
+//! Deterministic selection over an explicitly enumerated bounded fork set
+//! remains available to the outer relay.
 //!
 //! It deliberately does **not** claim full Bitcoin, Signet, BIP300, or Elements
-//! validity. A production guest must additionally port every remaining rule
-//! listed in `README.md`, including contextual/UTXO Bitcoin validation,
-//! best-work fork choice, all-slot BIP300 and M3/M4/M6 state replay, full
-//! Elements validity, confirmation tracking, and canonical burn extraction.
+//! validity. The outer relay must still authenticate fork availability and
+//! best-work selection, and the wider system must prove Elements burn validity.
+//! No API in this crate treats miner approval or an accumulator commitment as
+//! proof that an Elements burn transaction or block was valid.
 
 use core::cmp::Ordering;
 
 use sha2::{Digest, Sha256};
 
 mod block;
+mod finality;
+mod m6;
+mod operations;
 
 pub use block::{
-    apply_merkle_bound_elements_slot24_parent_block, verify_layer_two_signet_block_solution,
+    advance_genesis_derived_layer_two_signet_multislot_replay,
+    advance_genesis_derived_layer_two_signet_replay,
+    advance_layer_two_signet_bmm_confirmation_tracker,
+    apply_merkle_bound_elements_slot24_parent_block,
+    apply_merkle_bound_elements_slot24_parent_block_owned,
+    apply_merkle_bound_elements_slot24_parent_block_owned_with_m6_artifact,
+    apply_merkle_bound_elements_slot24_parent_block_with_m6_artifact,
+    initialize_layer_two_signet_genesis_replay,
+    initialize_layer_two_signet_genesis_replay_with_manifest_bound_accumulator,
+    initialize_layer_two_signet_multislot_genesis_replay,
+    initialize_layer_two_signet_multislot_genesis_replay_with_manifest_bound_accumulator,
+    verify_and_bind_layer_two_signet_bmm_confirmation_tracker,
+    verify_and_track_layer_two_signet_approved_slot24_accumulator_m6,
+    verify_and_track_layer_two_signet_multislot_approved_slot24_accumulator_m6,
+    verify_layer_two_signet_block_solution, verify_layer_two_signet_contextual_successor,
+    verify_layer_two_signet_mtp_successor,
     verify_layer_two_signet_pow_merkle_bound_elements_m7_successor,
     verify_pow_merkle_bound_elements_m7_successor, verify_serialized_block_merkle,
-    BlockStructureError, ElementsSlot24BlockEffects, ElementsSlot24BmmEdge,
+    ApprovedMultiSlotM6, ApprovedSlot24AccumulatorM6, ApprovedSlot24AccumulatorM6FinalityTracker,
+    ApprovedSlot24NativeWithdrawalM6, BlockStructureError, ContextualSignetBlockTransition,
+    ContextualSignetError, EffectiveSlot24M4, ElementsSlot24BlockEffects, ElementsSlot24BmmEdge,
     ElementsSlot24ReplayConfig, ElementsSlot24ReplayError, ElementsSlot24ReplayState,
-    LayerTwoSignetError, MerkleVerifiedBitcoinBlock, MintableSlot24Deposit, ParentBlockM7Error,
-    PendingSlot24Proposal, PowMerkleBoundM7, PowMerkleBoundM7Transition,
-    SignetPowMerkleBoundM7Transition, Slot24Ctip, ELEMENTS_V1_MAX_LIVE_PROPOSAL_BLOCKS,
-    ELEMENTS_V1_REQUIRED_PROPOSAL_HASH_INTERNAL, MAX_PENDING_SLOT24_PROPOSALS,
+    FinalizedSlot24AccumulatorRoot, GenesisDerivedLayerTwoSignetMultiSlotReplayState,
+    GenesisDerivedLayerTwoSignetReplayState, LayerTwoSignetError, MerkleVerifiedBitcoinBlock,
+    MintableSlot24Deposit, MultiSlotActivation,
+    MultiSlotApprovedSlot24AccumulatorM6FinalityTracker, MultiSlotBlockEffects,
+    MultiSlotBmmCommitment, MultiSlotCtip, MultiSlotDeposit, MultiSlotEffectiveM4,
+    MultiSlotEffectiveM4Action, MultiSlotPendingM6id, MultiSlotProposal, MultiSlotReplayError,
+    ParentBlockM7Error, PendingSlot24M6id, PendingSlot24Proposal, PowMerkleBoundM7,
+    PowMerkleBoundM7Transition, ProofCheckpointError, SignetPowMerkleBoundM7Transition,
+    Slot24AccumulatorIdentity, Slot24ApprovedRoot, Slot24Ctip, Slot24UsddContinuity,
+    ECASH_PROOF_CHECKPOINT_DOMAIN, ECASH_PROOF_CHECKPOINT_MAGIC, ECASH_PROOF_CHECKPOINT_SCHEMA,
+    ELEMENTS_V1_MAX_LIVE_PROPOSAL_BLOCKS, ELEMENTS_V1_REQUIRED_PROPOSAL_HASH_INTERNAL,
+    MAX_PENDING_SLOT24_M6IDS, MAX_PENDING_SLOT24_PROPOSALS,
+    SLOT24_ACCUMULATOR_M6_FINALITY_CONFIRMATIONS, SLOT24_M6_INCLUSION_THRESHOLD, SLOT24_M6_MAX_AGE,
+    SLOT24_M6_REQUIRED_SCORE,
+};
+#[cfg(feature = "enforcer-differential")]
+pub use block::{
+    EnforcerDifferentialActiveSlot, EnforcerDifferentialReplay, EnforcerDifferentialSnapshot,
+};
+pub use finality::{
+    bitcoin_block_confirmations, select_unique_best_work_tip, verify_contextual_successor,
+    verify_mtp_successor, BmmConfirmationError, BmmConfirmationTracker, ContextualHeaderChainState,
+    ContextualHeaderError, ForkChoiceError, MedianTimePastWindow, WorkForkCandidate,
+    BITCOIN_MAX_FUTURE_BLOCK_TIME_SECONDS, BITCOIN_MEDIAN_TIME_SPAN,
+};
+pub use m6::{
+    ActualM6Artifact, ApprovedClaimAppend, BlindedM6, ClaimBatchWitness, Ctip, M6Error,
+    MinerBundleArtifact, NativeWithdrawalM6, NativeWithdrawalReference, RootTransition,
+    ACTUAL_M6_MAGIC, BITCOIN_MAX_MONEY_SATS, BITCOIN_TRANSACTION_VERSION,
+    BURN_PROOF_ENCODED_LENGTH, M6_ARTIFACT_CODEC_VERSION, M6_ROOT_DOMAIN, M6_ROOT_DOMAIN_PREIMAGE,
+    M6_ROOT_PAYOUT_MAGIC, M6_ROOT_PAYOUT_SATS, M6_ROOT_PAYOUT_VERSION,
+    MAX_APPROVED_CLAIMS_PER_AUDIT_WITNESS, MAX_MINER_BUNDLE_ARTIFACT_SIZE,
+    MINER_BUNDLE_ARTIFACT_ENCODED_LENGTH, MINER_BUNDLE_MAGIC,
+    NATIVE_WITHDRAWAL_MAX_DESTINATION_SIZE, NATIVE_WITHDRAWAL_MAX_LEGACY_M6_SIZE,
+    NATIVE_WITHDRAWAL_REFERENCE_LENGTH, NATIVE_WITHDRAWAL_REFERENCE_MAGIC,
+    NATIVE_WITHDRAWAL_REFERENCE_VERSION, REDEMPTION_CLAIM_ENCODED_LENGTH,
+};
+pub use operations::{
+    ctip_from_replay, evaluate_bundle_operation, m3_proposal_script, BundleOperationError,
+    BundleOperationalAction, BundleOperationalSnapshot, PendingM6Observation,
+    M3_PROPOSE_BUNDLE_TAG,
+};
+pub use usdd_core::{
+    AbiUint256, Bip300RelayConfig, RelayConfigCodecError,
+    BIP300_WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD, BIP300_WITHDRAWAL_BUNDLE_MAX_AGE,
+    BITCOIN_BIP300_RELAY_CONFIG_ABI_LENGTH, BITCOIN_BIP300_RELAY_CONFIG_ABI_WORDS,
+    BITCOIN_BIP300_RELAY_CONFIG_DOMAIN, BITCOIN_BIP300_RELAY_CONFIG_FIELD_WORDS,
+    SLOT_24_ACTIVE_BITMAP,
 };
 
 /// Immutable BIP300/301 slot selected by the sole Elements Drivechain network.
 pub const ELEMENTS_DRIVECHAIN_SLOT: u8 = 24;
+
+/// Frozen LayerTwo-Labs Signet genesis difficulty from the exact local fork.
+pub const LAYER_TWO_SIGNET_GENESIS_BITS: u32 = 0x1e03_77ae;
+
+/// Frozen LayerTwo-Labs Signet genesis display-order block hash.
+pub const LAYER_TWO_SIGNET_GENESIS_DISPLAY: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x08, 0x81, 0x98, 0x73, 0xe9, 0x25, 0x42, 0x2c, 0x1f, 0xf0, 0xf9, 0x9f, 0x7c,
+    0xc9, 0xbb, 0xb2, 0x32, 0xaf, 0x63, 0xa0, 0x77, 0xa4, 0x80, 0xa3, 0x63, 0x3b, 0xee, 0x1e, 0xf6,
+];
+
+/// P2WPKH program committed by the sole Elements network's parent-Signet
+/// challenge (`0014 || program`). This intentionally follows the current
+/// network identity rather than the superseded public LayerTwo challenge.
+pub const ELEMENTS_PARENT_SIGNET_P2WPKH: [u8; 20] = [
+    0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45, 0xd1, 0xb3, 0xa3, 0x23,
+    0xf1, 0x43, 0x3b, 0xd6,
+];
 
 /// Bitcoin block headers are always exactly 80 bytes on the wire.
 pub const BITCOIN_HEADER_LEN: usize = 80;
@@ -886,25 +974,25 @@ mod tests {
     }
 
     #[test]
-    fn layer_two_signet_block_5580_header_matches_elements_regression_vector() {
-        // First 80 bytes of RAW_BLOCK_5580 in Elements validation_tests.cpp.
+    fn elements_parent_signet_block_218_header_matches_running_network_vector() {
+        // First 80 bytes of sole-network parent-Signet block 218.
         let raw = hex(concat!(
             "00000020",
-            "027d89a3fdacc10943565cfdbc1d5a32fb6f3d638e3a5dc0c9b7fd4546020000",
-            "f484c8e55e26cd1eb8d279dfbfd56c44a27995cdb4c057344f6b3e0951fc2b3d",
-            "b5c65a6a",
-            "3d77031e",
-            "24a88a00"
+            "4ce0fa42ef5db70645d0a7477cf5f0a6a6c11c582caa2378322be20262010000",
+            "215bd43642993a5d2930a576baccf213eb8de9f4304cd843b4a81f32c138a440",
+            "c6265d6a",
+            "ae77031e",
+            "65476000"
         ));
         let verified = verify_header_pow_against_caller_supplied_bits(
             &raw,
-            0x1e03_773d,
+            0x1e03_77ae,
             PowParameters::LAYER_TWO_SIGNET,
         )
-        .expect("LayerTwo Signet block 5580 PoW");
+        .expect("Elements parent-Signet block 218 PoW");
         assert_eq!(
             verified.hash,
-            display_hash("000002a28e4f1c4599a7878da30ce0197be99ffd1d8e6d20d1a032011448011e")
+            display_hash("0000034429ad7d70526abf86c3dcf328a5678f4122b827f266b4a095434410c7")
         );
     }
 

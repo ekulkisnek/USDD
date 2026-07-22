@@ -1,9 +1,13 @@
 //! Bounded slot-24 BIP300/301 replay for the Elements Drivechain identity.
 //!
-//! This module is a faithful, no-std port of the pure proposal/activation and
-//! fail-closed CTIP-increase logic in the local Elements fork's
-//! `ApplyDrivechainParentBlockState`. It also checks the exact BIP301 M8
-//! relationship implemented by the paired LayerTwo enforcer.
+//! This module is a bounded, no-std replay of the slot-24 path in the checked-in
+//! LayerTwo enforcer. It covers M1/M2 activation, ordered M3/M4 withdrawal
+//! voting, M5 deposits, exact native Elements withdrawals, canonical USDD
+//! accumulator M6 withdrawals, and M7/M8.
+//! It is deliberately restricted to histories replayed from the exact parent
+//! genesis: every enforcer-recognized M1, M2, or M3 for another slot rejects the
+//! whole block. That restriction keeps the global M4 vector exactly one entry
+//! after activation; it is not a replacement for an all-256-slot replay.
 //!
 //! The input block is transaction/Merkle-bound, but this layer does not prove
 //! contextual Bitcoin validity, Signet authorization, best-work membership, or
@@ -17,15 +21,23 @@ use alloc::{
     vec::Vec,
 };
 
+use usdd_core::{burn_accumulator_empty, Hash32, OutPoint};
+
 use crate::{
-    double_sha256, extract_single_op_return_push, BlockHash, BITCOIN_MAX_COINBASE_OUTPUTS,
-    ELEMENTS_DRIVECHAIN_SLOT,
+    double_sha256, extract_single_op_return_push,
+    m6::{
+        ActualM6Artifact, BlindedM6, Ctip, MinerBundleArtifact, NativeWithdrawalM6,
+        M6_ROOT_PAYOUT_SATS,
+    },
+    BlockHash, BITCOIN_MAX_COINBASE_OUTPUTS, ELEMENTS_DRIVECHAIN_SLOT,
 };
 
 use super::{parse_and_verify_block, BlockStructureError, ParsedBlock, ParsedTransaction};
 
 const M1_TAG: [u8; 4] = [0xd5, 0xe0, 0xc4, 0xaf];
 const M2_TAG: [u8; 4] = [0xd6, 0xe1, 0xc5, 0xdf];
+const M3_TAG: [u8; 4] = [0xd4, 0x5a, 0xa9, 0x43];
+const M4_TAG: [u8; 4] = [0xd7, 0x7d, 0x17, 0x76];
 const M7_TAG: [u8; 4] = [0xd1, 0x61, 0x73, 0x68];
 const M8_TAG: [u8; 3] = [0x00, 0xbf, 0x00];
 const OP_DRIVECHAIN: u8 = 0xb4; // OP_NOP5 in the unmodified Bitcoin opcode table.
@@ -37,28 +49,43 @@ const M7_CANONICAL_SCRIPT_LEN: usize = 1 + 1 + M7_PAYLOAD_LEN;
 const M8_PAYLOAD_LEN: usize = 3 + 1 + 32 + 32;
 const M8_CANONICAL_SCRIPT_LEN: usize = 1 + 1 + M8_PAYLOAD_LEN;
 
-/// Frozen internal/wire byte order of the sole Elements V1 proposal hash.
+/// Exact non-mainnet `Thresholds::SHORT` values in the checked-in enforcer.
+pub const SLOT24_M6_MAX_AGE: u16 = 10;
+pub const SLOT24_M6_INCLUSION_THRESHOLD: u16 = 5;
+pub const SLOT24_M6_REQUIRED_SCORE: u16 = SLOT24_M6_INCLUSION_THRESHOLD + 1;
+
+/// During coinbase processing, the enforcer adds this block's M3 messages
+/// before expiring entries which have just reached age eleven. The temporary
+/// transition state can therefore span twelve creation heights even though the
+/// persisted post-block state spans only ages `0..=10`. Every M3 occupies one
+/// coinbase output, so this is a history-derived ceiling rather than an
+/// arbitrary eviction limit.
+pub const MAX_PENDING_SLOT24_M6IDS: usize =
+    BITCOIN_MAX_COINBASE_OUTPUTS * (SLOT24_M6_MAX_AGE as usize + 2);
+
+/// Frozen internal/wire byte order of the installed Elements V4 proposal hash.
 ///
 /// Reversing these bytes produces the display hash
-/// `b27b2b233f9db48be36046b72cac4876efd24a3055bbb0c25392f52e55042f98`
+/// `8cbea2d0c306452647ac035d4ebe07467359426342d0fb4673e202258d456049`
 /// from `elements_drivechain_identity.h`.
 pub const ELEMENTS_V1_REQUIRED_PROPOSAL_HASH_INTERNAL: [u8; 32] = [
-    0x98, 0x2f, 0x04, 0x55, 0x2e, 0xf5, 0x92, 0x53, 0xc2, 0xb0, 0xbb, 0x55, 0x30, 0x4a, 0xd2, 0xef,
-    0x76, 0x48, 0xac, 0x2c, 0xb7, 0x46, 0x60, 0xe3, 0x8b, 0xb4, 0x9d, 0x3f, 0x23, 0x2b, 0x7b, 0xb2,
+    0x49, 0x60, 0x45, 0x8d, 0x25, 0x02, 0xe2, 0x73, 0x46, 0xfb, 0xd0, 0x42, 0x63, 0x42, 0x59, 0x73,
+    0x46, 0x07, 0xbe, 0x4e, 0x5d, 0x03, 0xac, 0x47, 0x26, 0x45, 0x06, 0xc3, 0xd0, 0xa2, 0xbe, 0x8c,
 ];
 
 /// Maximum creation-height window for a still-live Elements V1 proposal.
 pub const ELEMENTS_V1_MAX_LIVE_PROPOSAL_BLOCKS: usize = 10 + 1;
 
-/// Consensus-derived upper bound for every live slot-24 proposal.
+/// Consensus-derived upper bound while processing slot-24 proposals.
 ///
 /// The block parser proves that a coinbase has at most
-/// `BITCOIN_MAX_COINBASE_OUTPUTS` outputs. The frozen enforcer age is ten, so a
-/// live proposal can come from at most eleven creation heights (age 0..=10).
-/// Multiplying those independent maxima is deliberately permissive but cannot
-/// be exceeded by a block history accepted by the implemented parser/replay.
+/// `BITCOIN_MAX_COINBASE_OUTPUTS` outputs. The frozen enforcer inserts current
+/// M1s before its failure pass removes age-eleven proposals, so a transition
+/// can temporarily span twelve creation heights. Multiplying those independent
+/// maxima is deliberately permissive but cannot be exceeded by a valid parsed
+/// history.
 pub const MAX_PENDING_SLOT24_PROPOSALS: usize =
-    BITCOIN_MAX_COINBASE_OUTPUTS * ELEMENTS_V1_MAX_LIVE_PROPOSAL_BLOCKS;
+    BITCOIN_MAX_COINBASE_OUTPUTS * (ELEMENTS_V1_MAX_LIVE_PROPOSAL_BLOCKS + 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ElementsSlot24ReplayConfig {
@@ -138,7 +165,10 @@ impl ElementsSlot24ReplayConfig {
             self.unused_proposal_max_age,
             self.used_proposal_max_age,
         ))
-        .checked_add(1)
+        // The enforcer inserts this block's M1s before expiring proposals, so
+        // the in-transition bound needs one height beyond the persisted live
+        // window `0..=max_age`.
+        .checked_add(2)
         .ok_or(ElementsSlot24ReplayError::InvalidConfig)?;
         BITCOIN_MAX_COINBASE_OUTPUTS
             .checked_mul(live_blocks)
@@ -151,6 +181,111 @@ pub struct PendingSlot24Proposal {
     pub proposal_hash: [u8; 32],
     pub proposal_height: u32,
     pub votes: u16,
+}
+
+/// An M6id uses RPC/display byte order, matching `MinerBundleArtifact::m6id`.
+/// The M3 wire payload is reversed exactly once when it enters this state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingSlot24M6id {
+    pub m6id: Hash32,
+    pub proposal_height: u32,
+    pub score: u16,
+}
+
+/// Effective slot-24 action stored for BIP300 M4 `RepeatPrevious`.
+///
+/// The checked-in enforcer stores the prior block's effective diff, not merely
+/// its encoded M4. An upvote therefore remains here even if that block later
+/// spent or expired its target; repeating it then fails closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectiveSlot24M4 {
+    Upvote { m6id: Hash32 },
+    Alarm,
+}
+
+/// Immutable cross-domain identity against which every accumulator artifact is
+/// checked. The caller must bind these values to the frozen deployment
+/// manifest before attaching them to replay state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Slot24AccumulatorIdentity {
+    pub bitcoin_genesis: Hash32,
+    pub elements_genesis: Hash32,
+    pub usdd_asset: Hash32,
+    pub vault_id: Hash32,
+}
+
+impl Slot24AccumulatorIdentity {
+    fn validate(self) -> Result<(), ElementsSlot24ReplayError> {
+        if self.bitcoin_genesis == Hash32::ZERO
+            || self.elements_genesis == Hash32::ZERO
+            || self.usdd_asset == Hash32::ZERO
+            || self.vault_id == Hash32::ZERO
+        {
+            return Err(ElementsSlot24ReplayError::InvalidAccumulatorIdentity);
+        }
+        Ok(())
+    }
+
+    fn matches(self, artifact: &MinerBundleArtifact) -> bool {
+        artifact.bitcoin_genesis == self.bitcoin_genesis
+            && artifact.elements_genesis == self.elements_genesis
+            && artifact.usdd_asset == self.usdd_asset
+            && artifact.vault_id == self.vault_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Slot24ApprovedRoot {
+    pub claim_count: u64,
+    pub claim_root: Hash32,
+}
+
+impl Slot24ApprovedRoot {
+    pub fn empty() -> Self {
+        Self {
+            claim_count: 0,
+            claim_root: burn_accumulator_empty(64).expect("fixed burn-tree depth"),
+        }
+    }
+
+    fn validate(self) -> Result<(), ElementsSlot24ReplayError> {
+        if self.claim_root == Hash32::ZERO
+            || (self.claim_count == 0) != (self.claim_root == Self::empty().claim_root)
+        {
+            return Err(ElementsSlot24ReplayError::InvalidApprovedRoot);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApprovedSlot24AccumulatorM6 {
+    pub m6id: Hash32,
+    pub transaction_id: BlockHash,
+    pub block_hash: BlockHash,
+    pub block_height: u32,
+    pub fee_sats: u64,
+    pub prior_root: Slot24ApprovedRoot,
+    pub next_root: Slot24ApprovedRoot,
+}
+
+/// One miner-approved native Elements pegged-coin withdrawal. The replay
+/// authenticates the exact `ELWD` transaction and approved M6id. It does not
+/// validate the referenced Elements burn; the miner threshold is the accepted
+/// BIP300 authorization boundary for this transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedSlot24NativeWithdrawalM6 {
+    pub m6id: Hash32,
+    pub transaction_id: BlockHash,
+    pub block_hash: BlockHash,
+    pub block_height: u32,
+    pub elements_genesis: Hash32,
+    pub burn_outpoint: OutPoint,
+    pub parent_fee_sats: u64,
+    pub payout_sats: u64,
+    pub destination_script: Vec<u8>,
+    /// Native pegged-coin withdrawals never change the USDD root.
+    pub preserved_usdd_root: Slot24ApprovedRoot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +314,11 @@ pub struct ElementsSlot24ReplayState {
     required_activation: Option<(u32, BlockHash)>,
     pending_proposals: BTreeMap<[u8; 32], PendingSlot24Proposal>,
     ctip: Option<Slot24Ctip>,
+    pending_m6ids: Vec<PendingSlot24M6id>,
+    successful_m6ids: BTreeSet<Hash32>,
+    previous_effective_m4: Option<EffectiveSlot24M4>,
+    accumulator_identity: Option<Slot24AccumulatorIdentity>,
+    approved_root: Option<Slot24ApprovedRoot>,
 }
 
 impl ElementsSlot24ReplayState {
@@ -195,6 +335,11 @@ impl ElementsSlot24ReplayState {
             required_activation: None,
             pending_proposals: BTreeMap::new(),
             ctip: None,
+            pending_m6ids: Vec::new(),
+            successful_m6ids: BTreeSet::new(),
+            previous_effective_m4: None,
+            accumulator_identity: None,
+            approved_root: None,
         })
     }
 
@@ -203,6 +348,9 @@ impl ElementsSlot24ReplayState {
     /// Omitting pending proposals is unsound: an old M1 can be ACKed after the
     /// checkpoint. For that reason this constructor requires the entire live
     /// pending set and advertises that it does not authenticate its inputs.
+    /// It also cannot prove that no other sidechain slot was activated before
+    /// the checkpoint, so it cannot establish the sole-slot production
+    /// invariant. Production authorization must use the genesis-derived API.
     #[allow(clippy::too_many_arguments)]
     pub fn from_unverified_checkpoint_requires_manifest_binding(
         config: ElementsSlot24ReplayConfig,
@@ -231,7 +379,57 @@ impl ElementsSlot24ReplayState {
             required_activation,
             pending_proposals: pending,
             ctip,
+            pending_m6ids: Vec::new(),
+            successful_m6ids: BTreeSet::new(),
+            previous_effective_m4: None,
+            accumulator_identity: None,
+            approved_root: None,
         };
+        state.validate()?;
+        Ok(state)
+    }
+
+    /// Restore the complete slot-24 replay, including ordered withdrawal vote
+    /// state and accumulator checkpoint. Every field is unauthenticated until
+    /// compared with a frozen manifest and an authenticated ancestor history.
+    /// Even a manifest-bound value cannot prove the omitted state of the other
+    /// 255 slots; this constructor is therefore diagnostic, not a production
+    /// bootstrap for the sole-slot replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_unverified_usdd_checkpoint_requires_manifest_binding(
+        config: ElementsSlot24ReplayConfig,
+        processed_height: u32,
+        tip_hash: BlockHash,
+        active_proposal_hash: Option<[u8; 32]>,
+        required_activation: Option<(u32, BlockHash)>,
+        pending_proposals: Vec<PendingSlot24Proposal>,
+        ctip: Option<Slot24Ctip>,
+        pending_m6ids: Vec<PendingSlot24M6id>,
+        successful_m6ids: Vec<Hash32>,
+        previous_effective_m4: Option<EffectiveSlot24M4>,
+        accumulator_identity: Slot24AccumulatorIdentity,
+        approved_root: Slot24ApprovedRoot,
+    ) -> Result<Self, ElementsSlot24ReplayError> {
+        let mut state = Self::from_unverified_checkpoint_requires_manifest_binding(
+            config,
+            processed_height,
+            tip_hash,
+            active_proposal_hash,
+            required_activation,
+            pending_proposals,
+            ctip,
+        )?;
+        accumulator_identity.validate()?;
+        approved_root.validate()?;
+        state.pending_m6ids = pending_m6ids;
+        let successful_m6id_count = successful_m6ids.len();
+        state.successful_m6ids = successful_m6ids.into_iter().collect();
+        if state.successful_m6ids.len() != successful_m6id_count {
+            return Err(ElementsSlot24ReplayError::MalformedState);
+        }
+        state.previous_effective_m4 = previous_effective_m4;
+        state.accumulator_identity = Some(accumulator_identity);
+        state.approved_root = Some(approved_root);
         state.validate()?;
         Ok(state)
     }
@@ -256,6 +454,48 @@ impl ElementsSlot24ReplayState {
         self.ctip
     }
 
+    pub fn pending_m6ids(&self) -> impl ExactSizeIterator<Item = PendingSlot24M6id> + '_ {
+        self.pending_m6ids.iter().copied()
+    }
+
+    pub fn successful_m6ids(&self) -> impl ExactSizeIterator<Item = Hash32> + '_ {
+        self.successful_m6ids.iter().copied()
+    }
+
+    pub const fn previous_effective_m4(&self) -> Option<EffectiveSlot24M4> {
+        self.previous_effective_m4
+    }
+
+    pub const fn accumulator_identity(&self) -> Option<Slot24AccumulatorIdentity> {
+        self.accumulator_identity
+    }
+
+    pub const fn approved_root(&self) -> Option<Slot24ApprovedRoot> {
+        self.approved_root
+    }
+
+    /// Attach a manifest-authenticated accumulator checkpoint to a replay
+    /// clone. This is not a chain transition and therefore has an explicit
+    /// trust-boundary name. It is accepted only before any M3/M4 state exists.
+    pub fn bind_usdd_accumulator_checkpoint_requires_manifest_binding(
+        &mut self,
+        identity: Slot24AccumulatorIdentity,
+        approved_root: Slot24ApprovedRoot,
+    ) -> Result<(), ElementsSlot24ReplayError> {
+        identity.validate()?;
+        approved_root.validate()?;
+        if self.accumulator_identity.is_some()
+            || self.approved_root.is_some()
+            || !self.pending_m6ids.is_empty()
+            || self.previous_effective_m4.is_some()
+        {
+            return Err(ElementsSlot24ReplayError::AccumulatorAlreadyBound);
+        }
+        self.accumulator_identity = Some(identity);
+        self.approved_root = Some(approved_root);
+        self.validate()
+    }
+
     pub fn pending_proposals(&self) -> impl ExactSizeIterator<Item = PendingSlot24Proposal> + '_ {
         self.pending_proposals.values().copied()
     }
@@ -270,12 +510,26 @@ impl ElementsSlot24ReplayState {
         if self.pending_proposals.len() > self.config.maximum_pending_proposals()? {
             return Err(ElementsSlot24ReplayError::PendingProposalLimitExceeded);
         }
+        if self.pending_m6ids.len() > MAX_PENDING_SLOT24_M6IDS {
+            return Err(ElementsSlot24ReplayError::PendingM6idLimitExceeded);
+        }
+        match (self.accumulator_identity, self.approved_root) {
+            (Some(identity), Some(root)) => {
+                identity.validate()?;
+                root.validate()?;
+            }
+            (None, None) => {}
+            _ => return Err(ElementsSlot24ReplayError::MalformedState),
+        }
         if self.next_height == 0 {
             if self.tip_hash != BlockHash::ZERO
                 || self.active_proposal_hash.is_some()
                 || self.required_activation.is_some()
                 || !self.pending_proposals.is_empty()
                 || self.ctip.is_some()
+                || !self.pending_m6ids.is_empty()
+                || !self.successful_m6ids.is_empty()
+                || self.previous_effective_m4.is_some()
             {
                 return Err(ElementsSlot24ReplayError::MalformedState);
             }
@@ -285,6 +539,13 @@ impl ElementsSlot24ReplayState {
             return Err(ElementsSlot24ReplayError::MalformedState);
         }
         if self.active_proposal_hash.is_none() && self.ctip.is_some() {
+            return Err(ElementsSlot24ReplayError::MalformedState);
+        }
+        if self.active_proposal_hash.is_none()
+            && (!self.pending_m6ids.is_empty()
+                || !self.successful_m6ids.is_empty()
+                || self.previous_effective_m4.is_some())
+        {
             return Err(ElementsSlot24ReplayError::MalformedState);
         }
         if (self.active_proposal_hash == Some(self.config.required_proposal_hash))
@@ -301,10 +562,7 @@ impl ElementsSlot24ReplayState {
             }
         }
         if let Some(ctip) = self.ctip {
-            if ctip.txid == BlockHash::ZERO
-                || ctip.value_sat == 0
-                || ctip.value_sat > MAX_MONEY_SATOSHIS
-            {
+            if ctip.txid == BlockHash::ZERO || ctip.value_sat > MAX_MONEY_SATOSHIS {
                 return Err(ElementsSlot24ReplayError::MalformedState);
             }
         }
@@ -328,6 +586,32 @@ impl ElementsSlot24ReplayState {
                 return Err(ElementsSlot24ReplayError::MalformedState);
             }
         }
+
+        let mut seen_m6ids = BTreeSet::new();
+        let mut prior_proposal_height = None;
+        for pending in &self.pending_m6ids {
+            if pending.m6id == Hash32::ZERO
+                || !seen_m6ids.insert(pending.m6id)
+                || pending.proposal_height > tip_height
+                || tip_height - pending.proposal_height > u32::from(SLOT24_M6_MAX_AGE)
+                || prior_proposal_height.is_some_and(|prior| pending.proposal_height < prior)
+            {
+                return Err(ElementsSlot24ReplayError::MalformedState);
+            }
+            prior_proposal_height = Some(pending.proposal_height);
+        }
+        // Upstream permits an M3 to repropose an M6id that succeeded earlier
+        // on the active branch. Keep successful IDs only as bridge audit
+        // history; overlap with the live pending set is therefore valid.
+        if self.successful_m6ids.contains(&Hash32::ZERO) {
+            return Err(ElementsSlot24ReplayError::MalformedState);
+        }
+        if matches!(
+            self.previous_effective_m4,
+            Some(EffectiveSlot24M4::Upvote { m6id }) if m6id == Hash32::ZERO
+        ) {
+            return Err(ElementsSlot24ReplayError::MalformedState);
+        }
         Ok(())
     }
 }
@@ -345,8 +629,12 @@ pub struct ElementsSlot24BmmEdge {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ElementsSlot24BlockEffects {
     pub deposits: Vec<MintableSlot24Deposit>,
+    pub approved_accumulator_m6: Option<ApprovedSlot24AccumulatorM6>,
+    pub approved_native_withdrawal_m6: Option<ApprovedSlot24NativeWithdrawalM6>,
     pub bmm_edge: Option<ElementsSlot24BmmEdge>,
     pub matching_m8_requests: u32,
+    pub effective_m4: Option<EffectiveSlot24M4>,
+    pub expired_m6ids: Vec<Hash32>,
     /// True for an enforcer-recognized M7, including a nonminimal encoding
     /// which cannot authorize an Elements edge.
     pub saw_slot24_m7: bool,
@@ -361,8 +649,19 @@ pub enum ElementsSlot24ReplayError {
     BrokenParentLink,
     HeightOverflow,
     PendingProposalLimitExceeded,
+    PendingM6idLimitExceeded,
     DuplicateProposalMessage,
     MultipleAckMessages,
+    M1ForUnsupportedSlot,
+    M2ForUnsupportedSlot,
+    M3ForUnsupportedSlot,
+    M3ForInactiveSlot,
+    M3BundleAlreadyPending,
+    DuplicateM4,
+    M4InvalidVoteCount,
+    M4UpvoteMissingBundle,
+    M4TwoBytesWithinByteRange,
+    M4RepeatMissingBundle,
     VoteOverflow,
     ProposalHeightAhead,
     ProposalVotesAhead,
@@ -378,6 +677,27 @@ pub enum ElementsSlot24ReplayError {
     CtipSpentWithoutReplacement,
     ZeroCtipDelta,
     CtipDecreaseUnsupported,
+    MissingCanonicalM6Artifact,
+    UnexpectedCanonicalM6Artifact,
+    InvalidCanonicalM6Artifact,
+    CanonicalM6IdentityMismatch,
+    CanonicalM6RootMismatch,
+    CanonicalM6TransactionMismatch,
+    CanonicalM6NotPending,
+    CanonicalM6InsufficientScore,
+    RequiredProposalInactiveForM6,
+    NativeWithdrawalIdentityMismatch,
+    NativeWithdrawalTransactionMismatch,
+    NativeWithdrawalM6NotPending,
+    NativeWithdrawalM6InsufficientScore,
+    UnknownSlot24M6,
+    AmbiguousSlot24M6,
+    /// Bridge authorization policy, not an enforcer consensus rule. Upstream
+    /// may accept sequential M6s; V1 declines to authorize such a block.
+    MultipleSuccessfulSlot24M6s,
+    InvalidAccumulatorIdentity,
+    InvalidApprovedRoot,
+    AccumulatorAlreadyBound,
     MissingDepositAddress,
     AmountOverflow,
 }
@@ -390,24 +710,240 @@ impl From<BlockStructureError> for ElementsSlot24ReplayError {
 
 #[derive(Clone, Copy)]
 enum ParentMessage {
-    Proposal([u8; 32]),
-    Ack([u8; 32]),
+    Proposal { slot: u8, proposal_hash: [u8; 32] },
+    Ack { slot: u8, proposal_hash: [u8; 32] },
 }
 
-fn parse_slot24_parent_message(script: &[u8]) -> Option<ParentMessage> {
+impl ParentMessage {
+    fn slot(self) -> u8 {
+        match self {
+            Self::Proposal { slot, .. } | Self::Ack { slot, .. } => slot,
+        }
+    }
+
+    fn unsupported_slot_error(self) -> ElementsSlot24ReplayError {
+        match self {
+            Self::Proposal { .. } => ElementsSlot24ReplayError::M1ForUnsupportedSlot,
+            Self::Ack { .. } => ElementsSlot24ReplayError::M2ForUnsupportedSlot,
+        }
+    }
+}
+
+/// Parse exactly the M1/M2 forms recognized by the checked-in enforcer.
+///
+/// M1 consumes a one-byte slot followed by an arbitrary (possibly empty)
+/// description. M2 must contain exactly one slot byte and one 32-byte hash.
+/// `extract_single_op_return_push` also mirrors the enforcer's acceptance of a
+/// non-minimal push while rejecting trailing script instructions.
+fn parse_parent_message(script: &[u8]) -> Option<ParentMessage> {
     let payload = extract_single_op_return_push(script)?;
-    if payload.len() < 5 || payload[4] != ELEMENTS_DRIVECHAIN_SLOT {
+    if payload.len() < 5 {
         return None;
     }
     if payload[..4] == M1_TAG {
-        return Some(ParentMessage::Proposal(double_sha256(&payload[5..])));
+        return Some(ParentMessage::Proposal {
+            slot: payload[4],
+            proposal_hash: double_sha256(&payload[5..]),
+        });
     }
     if payload.len() == 4 + 1 + 32 && payload[..4] == M2_TAG {
         let mut hash = [0; 32];
         hash.copy_from_slice(&payload[5..]);
-        return Some(ParentMessage::Ack(hash));
+        return Some(ParentMessage::Ack {
+            slot: payload[4],
+            proposal_hash: hash,
+        });
     }
     None
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum M4Message {
+    RepeatPrevious,
+    OneByte(Vec<u8>),
+    TwoBytes(Vec<u16>),
+    LeadingBy50,
+}
+
+fn parse_m3(script: &[u8]) -> Option<(u8, Hash32)> {
+    let payload = extract_single_op_return_push(script)?;
+    if payload.len() != 4 + 1 + 32 || payload[..4] != M3_TAG {
+        return None;
+    }
+    let slot = payload[4];
+    // `bitcoin::Txid::to_byte_array` is the internal hash byte order carried by
+    // M3. Canonical m6.rs artifacts expose RPC/display order.
+    let mut display = [0u8; 32];
+    display.copy_from_slice(&payload[5..]);
+    display.reverse();
+    Some((slot, Hash32(display)))
+}
+
+fn parse_m4(script: &[u8]) -> Option<M4Message> {
+    let payload = extract_single_op_return_push(script)?;
+    if payload.len() < 5 || payload[..4] != M4_TAG {
+        return None;
+    }
+    let body = &payload[5..];
+    match payload[4] {
+        0 if body.is_empty() => Some(M4Message::RepeatPrevious),
+        1 => Some(M4Message::OneByte(body.to_vec())),
+        2 if body.len() % 2 == 0 => Some(M4Message::TwoBytes(
+            body.chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect(),
+        )),
+        3 if body.is_empty() => Some(M4Message::LeadingBy50),
+        _ => None,
+    }
+}
+
+/// Enforce the temporary, explicit one-slot model before mutating any replay
+/// state. From exact genesis this proves that no accepted history can activate
+/// another slot and silently change the enforcer's active-slot-ordered M4
+/// vector. Malformed tag-like scripts remain ordinary outputs, as they do in
+/// the checked-in enforcer.
+fn reject_well_formed_non_slot24_coinbase_messages(
+    parsed: &ParsedBlock<'_>,
+) -> Result<(), ElementsSlot24ReplayError> {
+    for output in &parsed.coinbase.outputs {
+        if let Some(message) = parse_parent_message(output.script) {
+            if message.slot() != ELEMENTS_DRIVECHAIN_SLOT {
+                return Err(message.unsupported_slot_error());
+            }
+        }
+        if let Some((slot, _)) = parse_m3(output.script) {
+            if slot != ELEMENTS_DRIVECHAIN_SLOT {
+                return Err(ElementsSlot24ReplayError::M3ForUnsupportedSlot);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pending_m6_index(state: &ElementsSlot24ReplayState, m6id: Hash32) -> Option<usize> {
+    state
+        .pending_m6ids
+        .iter()
+        .position(|pending| pending.m6id == m6id)
+}
+
+fn apply_m4_upvote(
+    state: &mut ElementsSlot24ReplayState,
+    target_index: usize,
+) -> Result<Option<EffectiveSlot24M4>, ElementsSlot24ReplayError> {
+    let target = state
+        .pending_m6ids
+        .get(target_index)
+        .copied()
+        .ok_or(ElementsSlot24ReplayError::M4UpvoteMissingBundle)?;
+    if target.score == u16::MAX {
+        return Ok(None);
+    }
+    for (index, pending) in state.pending_m6ids.iter_mut().enumerate() {
+        if index == target_index {
+            pending.score = pending
+                .score
+                .checked_add(1)
+                .ok_or(ElementsSlot24ReplayError::VoteOverflow)?;
+        } else {
+            pending.score = pending.score.saturating_sub(1);
+        }
+    }
+    Ok(Some(EffectiveSlot24M4::Upvote { m6id: target.m6id }))
+}
+
+fn apply_m4_alarm(state: &mut ElementsSlot24ReplayState) -> Option<EffectiveSlot24M4> {
+    let mut changed = false;
+    for pending in &mut state.pending_m6ids {
+        changed |= pending.score != 0;
+        pending.score = pending.score.saturating_sub(1);
+    }
+    changed.then_some(EffectiveSlot24M4::Alarm)
+}
+
+fn apply_m4_vote(
+    state: &mut ElementsSlot24ReplayState,
+    vote: u16,
+) -> Result<Option<EffectiveSlot24M4>, ElementsSlot24ReplayError> {
+    match vote {
+        0xffff => Ok(None),
+        0xfffe => Ok(apply_m4_alarm(state)),
+        index => apply_m4_upvote(state, usize::from(index)),
+    }
+}
+
+fn apply_m4_message(
+    state: &mut ElementsSlot24ReplayState,
+    message: &M4Message,
+) -> Result<Option<EffectiveSlot24M4>, ElementsSlot24ReplayError> {
+    // The frozen relay manifest asserts that slot 24 is the sole active slot.
+    // This gives the generic enforcer's active-slot-ordered vote vector length
+    // exactly zero before activation and exactly one afterwards.
+    let expected_votes = usize::from(state.active_proposal_hash.is_some());
+    match message {
+        M4Message::OneByte(votes) => {
+            if votes.len() != expected_votes {
+                return Err(ElementsSlot24ReplayError::M4InvalidVoteCount);
+            }
+            if let Some(vote) = votes.first().copied() {
+                let vote = match vote {
+                    0xff => 0xffff,
+                    0xfe => 0xfffe,
+                    value => u16::from(value),
+                };
+                apply_m4_vote(state, vote)
+            } else {
+                Ok(None)
+            }
+        }
+        M4Message::TwoBytes(votes) => {
+            // Match the enforcer's dispatcher ordering: this encoding rule is
+            // checked before the active-sidechain vector length.
+            if votes.iter().all(|vote| *vote <= 253) {
+                return Err(ElementsSlot24ReplayError::M4TwoBytesWithinByteRange);
+            }
+            if votes.len() != expected_votes {
+                return Err(ElementsSlot24ReplayError::M4InvalidVoteCount);
+            }
+            if let Some(vote) = votes.first().copied() {
+                apply_m4_vote(state, vote)
+            } else {
+                Ok(None)
+            }
+        }
+        M4Message::LeadingBy50 => {
+            if expected_votes == 0 || state.pending_m6ids.is_empty() {
+                return Ok(None);
+            }
+            let mut highest_index = 0usize;
+            let mut highest = 0u16;
+            let mut second = 0u16;
+            for (index, pending) in state.pending_m6ids.iter().enumerate() {
+                if pending.score > highest {
+                    second = highest;
+                    highest = pending.score;
+                    highest_index = index;
+                } else if pending.score > second {
+                    second = pending.score;
+                }
+            }
+            if highest.saturating_sub(second) >= 50 && highest < u16::MAX {
+                apply_m4_upvote(state, highest_index)
+            } else {
+                Ok(None)
+            }
+        }
+        M4Message::RepeatPrevious => match state.previous_effective_m4 {
+            None => Ok(None),
+            Some(EffectiveSlot24M4::Alarm) => Ok(apply_m4_alarm(state)),
+            Some(EffectiveSlot24M4::Upvote { m6id }) => {
+                let index = pending_m6_index(state, m6id)
+                    .ok_or(ElementsSlot24ReplayError::M4RepeatMissingBundle)?;
+                apply_m4_upvote(state, index)
+            }
+        },
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -483,19 +1019,90 @@ fn output_value(output: &super::ParsedOutput<'_>) -> u64 {
     i64::from_le_bytes(output.value) as u64
 }
 
+fn encode_compact_size(value: usize, out: &mut Vec<u8>) {
+    if value < 0xfd {
+        out.push(value as u8);
+    } else if value <= usize::from(u16::MAX) {
+        out.push(0xfd);
+        out.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value <= usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+        out.push(0xfe);
+        out.extend_from_slice(&(value as u32).to_le_bytes());
+    } else {
+        out.push(0xff);
+        out.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+}
+
+/// Reproduce the enforcer's inverse M6 blinding over an already parsed actual
+/// transaction. The sole CTIP input is removed and treasury vout zero becomes
+/// the zero-valued, eight-byte big-endian fee commitment; every other field is
+/// preserved in non-witness serialization.
+fn derive_blinded_m6_legacy(
+    transaction: &ParsedTransaction<'_>,
+    previous_ctip_value: u64,
+) -> Result<(Vec<u8>, Hash32), ElementsSlot24ReplayError> {
+    if transaction.inputs.len() != 1
+        || transaction.outputs.is_empty()
+        || !is_slot24_treasury(transaction.outputs[0].script)
+    {
+        return Err(ElementsSlot24ReplayError::UnknownSlot24M6);
+    }
+    let new_ctip_value = output_value(&transaction.outputs[0]);
+    let payout_total = transaction.outputs[1..]
+        .iter()
+        .try_fold(0u64, |sum, output| {
+            sum.checked_add(output_value(output))
+                .ok_or(ElementsSlot24ReplayError::AmountOverflow)
+        })?;
+    let committed_total = new_ctip_value
+        .checked_add(payout_total)
+        .ok_or(ElementsSlot24ReplayError::AmountOverflow)?;
+    let fee_sats = previous_ctip_value
+        .checked_sub(committed_total)
+        .ok_or(ElementsSlot24ReplayError::UnknownSlot24M6)?;
+
+    let mut blinded = Vec::new();
+    blinded.extend_from_slice(&transaction.version);
+    blinded.push(0);
+    encode_compact_size(transaction.outputs.len(), &mut blinded);
+
+    blinded.extend_from_slice(&0u64.to_le_bytes());
+    blinded.push(10);
+    blinded.extend_from_slice(&[OP_RETURN, 8]);
+    blinded.extend_from_slice(&fee_sats.to_be_bytes());
+    for output in transaction.outputs.iter().skip(1) {
+        blinded.extend_from_slice(&output.value);
+        encode_compact_size(output.script.len(), &mut blinded);
+        blinded.extend_from_slice(output.script);
+    }
+    blinded.extend_from_slice(&transaction.lock_time);
+
+    let mut m6id = double_sha256(&blinded);
+    m6id.reverse();
+    Ok((blinded, Hash32(m6id)))
+}
+
 fn apply_coinbase_messages(
     state: &mut ElementsSlot24ReplayState,
     parsed: &ParsedBlock<'_>,
     height: u32,
-) -> Result<(), ElementsSlot24ReplayError> {
+) -> Result<(Option<EffectiveSlot24M4>, Vec<Hash32>), ElementsSlot24ReplayError> {
     let mut created_in_block = BTreeSet::new();
     let mut proposal_messages_in_block = BTreeSet::new();
     let mut saw_ack = false;
+    let mut saw_m4 = false;
+    let mut effective_m4 = None;
 
     for output in &parsed.coinbase.outputs {
-        match parse_slot24_parent_message(output.script) {
+        match parse_parent_message(output.script) {
             None => {}
-            Some(ParentMessage::Proposal(proposal_hash)) => {
+            Some(message) if message.slot() != ELEMENTS_DRIVECHAIN_SLOT => {
+                // The block-level preflight above makes this unreachable. Keep
+                // the local guard so future call-path refactors fail closed.
+                return Err(message.unsupported_slot_error());
+            }
+            Some(ParentMessage::Proposal { proposal_hash, .. }) => {
                 if !proposal_messages_in_block.insert(proposal_hash) {
                     return Err(ElementsSlot24ReplayError::DuplicateProposalMessage);
                 }
@@ -514,7 +1121,7 @@ fn apply_coinbase_messages(
                     created_in_block.insert(proposal_hash);
                 }
             }
-            Some(ParentMessage::Ack(proposal_hash)) => {
+            Some(ParentMessage::Ack { proposal_hash, .. }) => {
                 if saw_ack {
                     return Err(ElementsSlot24ReplayError::MultipleAckMessages);
                 }
@@ -548,6 +1155,35 @@ fn apply_coinbase_messages(
                 }
             }
         }
+
+        if let Some((slot, m6id)) = parse_m3(output.script) {
+            if slot != ELEMENTS_DRIVECHAIN_SLOT {
+                return Err(ElementsSlot24ReplayError::M3ForUnsupportedSlot);
+            }
+            if state.active_proposal_hash.is_none() {
+                return Err(ElementsSlot24ReplayError::M3ForInactiveSlot);
+            }
+            if pending_m6_index(state, m6id).is_some() {
+                return Err(ElementsSlot24ReplayError::M3BundleAlreadyPending);
+            }
+            if state.pending_m6ids.len() == MAX_PENDING_SLOT24_M6IDS {
+                return Err(ElementsSlot24ReplayError::PendingM6idLimitExceeded);
+            }
+            state.pending_m6ids.push(PendingSlot24M6id {
+                m6id,
+                proposal_height: height,
+                // Exact `PendingM6idInfo::new` behavior.
+                score: 1,
+            });
+        }
+
+        if let Some(message) = parse_m4(output.script) {
+            if saw_m4 {
+                return Err(ElementsSlot24ReplayError::DuplicateM4);
+            }
+            saw_m4 = true;
+            effective_m4 = apply_m4_message(state, &message)?;
+        }
     }
 
     // Match the enforcer/fork ordering: activation happens first, then every
@@ -572,17 +1208,203 @@ fn apply_coinbase_messages(
     for hash in expired {
         state.pending_proposals.remove(&hash);
     }
-    Ok(())
+
+    // The checked-in enforcer applies M4 first and expires M6ids afterwards.
+    // Keep the effective action even if its target expires below, because a
+    // next-block RepeatPrevious must then reject that missing target.
+    let mut expired_m6ids = Vec::new();
+    state.pending_m6ids.retain(|pending| {
+        let age = height.saturating_sub(pending.proposal_height);
+        let live = age <= u32::from(SLOT24_M6_MAX_AGE);
+        if !live {
+            expired_m6ids.push(pending.m6id);
+        }
+        live
+    });
+    state.previous_effective_m4 = effective_m4;
+    Ok((effective_m4, expired_m6ids))
 }
+
+fn apply_canonical_accumulator_m6(
+    state: &mut ElementsSlot24ReplayState,
+    transaction: &ParsedTransaction<'_>,
+    artifact: &MinerBundleArtifact,
+    old_ctip: Slot24Ctip,
+    new_ctip_value: u64,
+    block_hash: BlockHash,
+    block_height: u32,
+) -> Result<ApprovedSlot24AccumulatorM6, ElementsSlot24ReplayError> {
+    if !state.required_proposal_is_active() {
+        return Err(ElementsSlot24ReplayError::RequiredProposalInactiveForM6);
+    }
+    let identity = state
+        .accumulator_identity
+        .ok_or(ElementsSlot24ReplayError::InvalidAccumulatorIdentity)?;
+    let prior_root = state
+        .approved_root
+        .ok_or(ElementsSlot24ReplayError::InvalidApprovedRoot)?;
+    artifact
+        .validate()
+        .map_err(|_| ElementsSlot24ReplayError::InvalidCanonicalM6Artifact)?;
+    if !identity.matches(artifact) {
+        return Err(ElementsSlot24ReplayError::CanonicalM6IdentityMismatch);
+    }
+    if artifact.prior_claim_count != prior_root.claim_count
+        || artifact.prior_claim_root != prior_root.claim_root
+    {
+        return Err(ElementsSlot24ReplayError::CanonicalM6RootMismatch);
+    }
+    let next_root = Slot24ApprovedRoot {
+        claim_count: artifact.next_claim_count,
+        claim_root: artifact.next_claim_root,
+    };
+    next_root.validate()?;
+
+    let required_delta = artifact
+        .fee_sats
+        .checked_add(M6_ROOT_PAYOUT_SATS)
+        .ok_or(ElementsSlot24ReplayError::InvalidCanonicalM6Artifact)?;
+    if old_ctip.value_sat.checked_sub(new_ctip_value) != Some(required_delta) {
+        return Err(ElementsSlot24ReplayError::CanonicalM6TransactionMismatch);
+    }
+    let canonical_prior_ctip = Ctip {
+        outpoint: OutPoint {
+            txid: Hash32(old_ctip.txid.to_display_bytes()),
+            vout: old_ctip.vout,
+        },
+        value_sats: old_ctip.value_sat,
+    };
+    let actual = ActualM6Artifact::build(artifact.clone(), canonical_prior_ctip)
+        .map_err(|_| ElementsSlot24ReplayError::InvalidCanonicalM6Artifact)?;
+    actual
+        .verify_transaction(transaction.serialized)
+        .map_err(|_| ElementsSlot24ReplayError::CanonicalM6TransactionMismatch)?;
+    if actual
+        .transaction_id()
+        .map_err(|_| ElementsSlot24ReplayError::CanonicalM6TransactionMismatch)?
+        != Hash32(transaction.txid.to_display_bytes())
+        || actual.successor_ctip_value() != new_ctip_value
+    {
+        return Err(ElementsSlot24ReplayError::CanonicalM6TransactionMismatch);
+    }
+
+    let m6id = artifact
+        .m6id()
+        .map_err(|_| ElementsSlot24ReplayError::InvalidCanonicalM6Artifact)?;
+    let pending_index =
+        pending_m6_index(state, m6id).ok_or(ElementsSlot24ReplayError::CanonicalM6NotPending)?;
+    if state.pending_m6ids[pending_index].score <= SLOT24_M6_INCLUSION_THRESHOLD {
+        return Err(ElementsSlot24ReplayError::CanonicalM6InsufficientScore);
+    }
+
+    // Mutate only after all artifact, transaction, vote, and transition checks.
+    state.pending_m6ids.remove(pending_index);
+    // Audit history only. Upstream does not make a paid M6id permanently
+    // unavailable, so a repeated success is not a consensus error here.
+    state.successful_m6ids.insert(m6id);
+    state.approved_root = Some(next_root);
+    Ok(ApprovedSlot24AccumulatorM6 {
+        m6id,
+        transaction_id: transaction.txid,
+        block_hash,
+        block_height,
+        fee_sats: artifact.fee_sats,
+        prior_root,
+        next_root,
+    })
+}
+
+fn apply_native_withdrawal_m6(
+    state: &mut ElementsSlot24ReplayState,
+    transaction: &ParsedTransaction<'_>,
+    native: &NativeWithdrawalM6,
+    old_ctip: Slot24Ctip,
+    new_ctip_value: u64,
+    block_hash: BlockHash,
+    block_height: u32,
+) -> Result<ApprovedSlot24NativeWithdrawalM6, ElementsSlot24ReplayError> {
+    if !state.required_proposal_is_active() {
+        return Err(ElementsSlot24ReplayError::RequiredProposalInactiveForM6);
+    }
+    let identity = state
+        .accumulator_identity
+        .ok_or(ElementsSlot24ReplayError::InvalidAccumulatorIdentity)?;
+    let preserved_usdd_root = state
+        .approved_root
+        .ok_or(ElementsSlot24ReplayError::InvalidApprovedRoot)?;
+    let reference = native.reference();
+    if reference.sidechain_slot() != ELEMENTS_DRIVECHAIN_SLOT
+        || reference.elements_genesis() != identity.elements_genesis
+    {
+        return Err(ElementsSlot24ReplayError::NativeWithdrawalIdentityMismatch);
+    }
+
+    let prior_ctip = Ctip {
+        outpoint: OutPoint {
+            txid: Hash32(old_ctip.txid.to_display_bytes()),
+            vout: old_ctip.vout,
+        },
+        value_sats: old_ctip.value_sat,
+    };
+    native
+        .verify_actual_transaction(transaction.serialized, &prior_ctip)
+        .map_err(|_| ElementsSlot24ReplayError::NativeWithdrawalTransactionMismatch)?;
+    let successor = native
+        .successor_ctip(&prior_ctip)
+        .map_err(|_| ElementsSlot24ReplayError::NativeWithdrawalTransactionMismatch)?;
+    if successor.value_sats != new_ctip_value
+        || successor.outpoint.vout != 0
+        || successor.outpoint.txid != Hash32(transaction.txid.to_display_bytes())
+    {
+        return Err(ElementsSlot24ReplayError::NativeWithdrawalTransactionMismatch);
+    }
+
+    let m6id = native.m6id();
+    let pending_index = pending_m6_index(state, m6id)
+        .ok_or(ElementsSlot24ReplayError::NativeWithdrawalM6NotPending)?;
+    if state.pending_m6ids[pending_index].score <= SLOT24_M6_INCLUSION_THRESHOLD {
+        return Err(ElementsSlot24ReplayError::NativeWithdrawalM6InsufficientScore);
+    }
+
+    // Root preservation is structural: native withdrawals remove only their
+    // approved M6id and rotate CTIP. No accumulator field is assigned here.
+    state.pending_m6ids.remove(pending_index);
+    // Audit history only; see the accumulator path above.
+    state.successful_m6ids.insert(m6id);
+    debug_assert_eq!(state.approved_root, Some(preserved_usdd_root));
+    Ok(ApprovedSlot24NativeWithdrawalM6 {
+        m6id,
+        transaction_id: transaction.txid,
+        block_hash,
+        block_height,
+        elements_genesis: reference.elements_genesis(),
+        burn_outpoint: reference.burn_outpoint(),
+        parent_fee_sats: native.parent_fee_sats(),
+        payout_sats: native.payout_sats(),
+        destination_script: native.destination_script().to_vec(),
+        preserved_usdd_root,
+    })
+}
+
+type Slot24TransactionTransitionEffects = (
+    Vec<MintableSlot24Deposit>,
+    u32,
+    Option<ApprovedSlot24AccumulatorM6>,
+    Option<ApprovedSlot24NativeWithdrawalM6>,
+);
 
 fn apply_transactions(
     state: &mut ElementsSlot24ReplayState,
     parsed: &ParsedBlock<'_>,
     height: u32,
     observed_m7: Option<ObservedM7>,
-) -> Result<(Vec<MintableSlot24Deposit>, u32), ElementsSlot24ReplayError> {
+    canonical_m6_artifact: Option<&MinerBundleArtifact>,
+) -> Result<Slot24TransactionTransitionEffects, ElementsSlot24ReplayError> {
     let mut deposits = Vec::new();
     let mut matching_m8_requests = 0u32;
+    let mut approved_accumulator_m6 = None;
+    let mut approved_native_withdrawal_m6 = None;
+    let mut artifact_consumed = false;
     let required_active_for_transactions = state.required_proposal_is_active();
 
     for transaction in parsed.transactions.iter().skip(1) {
@@ -648,9 +1470,77 @@ fn apply_transactions(
             return Err(ElementsSlot24ReplayError::ZeroCtipDelta);
         }
         if new_value < old_value {
-            // Full M3/M4/M6 vote replay is deliberately absent. A decrease is
-            // never guessed or optimistically accepted.
-            return Err(ElementsSlot24ReplayError::CtipDecreaseUnsupported);
+            if approved_accumulator_m6.is_some() || approved_native_withdrawal_m6.is_some() {
+                return Err(ElementsSlot24ReplayError::MultipleSuccessfulSlot24M6s);
+            }
+            let old_ctip = state
+                .ctip
+                .ok_or(ElementsSlot24ReplayError::CtipDecreaseUnsupported)?;
+            if output_index != 0 || transaction.inputs.len() != 1 {
+                return Err(ElementsSlot24ReplayError::UnknownSlot24M6);
+            }
+            let (blinded_legacy, derived_m6id) =
+                derive_blinded_m6_legacy(transaction, old_ctip.value_sat)?;
+            let native = NativeWithdrawalM6::decode_legacy(&blinded_legacy).ok();
+            let canonical_shape = BlindedM6::decode(&blinded_legacy).is_ok();
+            let canonical_artifact_m6id = canonical_m6_artifact
+                .map(|artifact| {
+                    artifact
+                        .m6id()
+                        .map_err(|_| ElementsSlot24ReplayError::InvalidCanonicalM6Artifact)
+                })
+                .transpose()?;
+            let artifact_matches = canonical_artifact_m6id == Some(derived_m6id);
+
+            // A hash collision or future codec overlap must not let an actual
+            // M6 select two state transitions. Likewise an unrelated supplied
+            // artifact is never silently ignored for a native payment.
+            if native.is_some() && artifact_matches {
+                return Err(ElementsSlot24ReplayError::AmbiguousSlot24M6);
+            }
+            if artifact_matches || (canonical_shape && canonical_m6_artifact.is_some()) {
+                let artifact = canonical_m6_artifact
+                    .expect("matching artifact id requires a supplied artifact");
+                let approved = apply_canonical_accumulator_m6(
+                    state,
+                    transaction,
+                    artifact,
+                    old_ctip,
+                    new_value,
+                    parsed.metadata.block_hash,
+                    height,
+                )?;
+                approved_accumulator_m6 = Some(approved);
+                artifact_consumed = true;
+            } else if let Some(native) = native.as_ref() {
+                let approved = apply_native_withdrawal_m6(
+                    state,
+                    transaction,
+                    native,
+                    old_ctip,
+                    new_value,
+                    parsed.metadata.block_hash,
+                    height,
+                )?;
+                approved_native_withdrawal_m6 = Some(approved);
+            } else if canonical_shape {
+                return Err(if canonical_m6_artifact.is_some() {
+                    ElementsSlot24ReplayError::CanonicalM6TransactionMismatch
+                } else {
+                    ElementsSlot24ReplayError::MissingCanonicalM6Artifact
+                });
+            } else {
+                return Err(ElementsSlot24ReplayError::UnknownSlot24M6);
+            }
+
+            let ctip = Slot24Ctip {
+                txid: transaction.txid,
+                vout: u32::try_from(output_index)
+                    .map_err(|_| ElementsSlot24ReplayError::OutputIndexOverflow)?,
+                value_sat: new_value,
+            };
+            state.ctip = Some(ctip);
+            continue;
         }
         let address = transaction
             .outputs
@@ -678,7 +1568,19 @@ fn apply_transactions(
             });
         }
     }
-    Ok((deposits, matching_m8_requests))
+    if canonical_m6_artifact.is_some() && !artifact_consumed {
+        return Err(if approved_native_withdrawal_m6.is_some() {
+            ElementsSlot24ReplayError::AmbiguousSlot24M6
+        } else {
+            ElementsSlot24ReplayError::UnexpectedCanonicalM6Artifact
+        });
+    }
+    Ok((
+        deposits,
+        matching_m8_requests,
+        approved_accumulator_m6,
+        approved_native_withdrawal_m6,
+    ))
 }
 
 /// Apply one exact, Merkle-verified parent block to the bounded slot-24 replay.
@@ -688,28 +1590,80 @@ fn apply_transactions(
 /// active *and* the successor coinbase carries the fork's strict minimal M7.
 ///
 /// This function does not prove contextual Bitcoin validity, Signet
-/// authorization, best-work membership, full BIP300 withdrawal voting, or
-/// Elements validity. A caller must compose all of those checks before using
-/// any returned edge or deposit as bridge authorization.
+/// authorization, best-work membership, or BIP300 withdrawal approval. No
+/// returned edge or deposit is USDD redemption authorization.
 pub fn apply_merkle_bound_elements_slot24_parent_block(
     state: &mut ElementsSlot24ReplayState,
     serialized_block: &[u8],
 ) -> Result<ElementsSlot24BlockEffects, ElementsSlot24ReplayError> {
-    state.validate()?;
-    let parsed = parse_and_verify_block(serialized_block)?;
-    if state.next_height != 0 && parsed.metadata.header.previous_block != state.tip_hash {
-        return Err(ElementsSlot24ReplayError::BrokenParentLink);
-    }
-    if state.next_height == 0 && parsed.metadata.header.previous_block != BlockHash::ZERO {
-        return Err(ElementsSlot24ReplayError::BrokenParentLink);
-    }
-    let height = state.next_height;
-    let mut next = state.clone();
+    let (next, effects) = apply_merkle_bound_elements_slot24_parent_block_owned_with_m6_artifact(
+        state.clone(),
+        serialized_block,
+        None,
+    )?;
+    *state = next;
+    Ok(effects)
+}
 
-    apply_coinbase_messages(&mut next, &parsed, height)?;
+/// Apply one block while supplying the sole canonical accumulator artifact
+/// which may authorize a slot-24 CTIP decrease in that block. The artifact is
+/// untrusted auxiliary data: its M6id, identity, prior/next root, fee, and exact
+/// actual transaction are independently recomputed before state changes.
+pub fn apply_merkle_bound_elements_slot24_parent_block_with_m6_artifact(
+    state: &mut ElementsSlot24ReplayState,
+    serialized_block: &[u8],
+    canonical_m6_artifact: &MinerBundleArtifact,
+) -> Result<ElementsSlot24BlockEffects, ElementsSlot24ReplayError> {
+    let (next, effects) = apply_merkle_bound_elements_slot24_parent_block_owned_with_m6_artifact(
+        state.clone(),
+        serialized_block,
+        Some(canonical_m6_artifact),
+    )?;
+    *state = next;
+    Ok(effects)
+}
+
+/// Owned form used by composed consensus primitives. Consuming the prior
+/// state avoids an additional full clone of the potentially large pending
+/// proposal map. On failure the state is discarded, which is the desired
+/// behavior for a proof execution that aborts fail-closed.
+pub fn apply_merkle_bound_elements_slot24_parent_block_owned(
+    next: ElementsSlot24ReplayState,
+    serialized_block: &[u8],
+) -> Result<(ElementsSlot24ReplayState, ElementsSlot24BlockEffects), ElementsSlot24ReplayError> {
+    apply_merkle_bound_elements_slot24_parent_block_owned_with_m6_artifact(
+        next,
+        serialized_block,
+        None,
+    )
+}
+
+pub fn apply_merkle_bound_elements_slot24_parent_block_owned_with_m6_artifact(
+    mut next: ElementsSlot24ReplayState,
+    serialized_block: &[u8],
+    canonical_m6_artifact: Option<&MinerBundleArtifact>,
+) -> Result<(ElementsSlot24ReplayState, ElementsSlot24BlockEffects), ElementsSlot24ReplayError> {
+    next.validate()?;
+    let parsed = parse_and_verify_block(serialized_block)?;
+    if next.next_height != 0 && parsed.metadata.header.previous_block != next.tip_hash {
+        return Err(ElementsSlot24ReplayError::BrokenParentLink);
+    }
+    if next.next_height == 0 && parsed.metadata.header.previous_block != BlockHash::ZERO {
+        return Err(ElementsSlot24ReplayError::BrokenParentLink);
+    }
+    let height = next.next_height;
+
+    reject_well_formed_non_slot24_coinbase_messages(&parsed)?;
+    let (effective_m4, expired_m6ids) = apply_coinbase_messages(&mut next, &parsed, height)?;
     let observed_m7 = observe_slot24_m7(&parsed)?;
-    let (deposits, matching_m8_requests) =
-        apply_transactions(&mut next, &parsed, height, observed_m7)?;
+    let (deposits, matching_m8_requests, approved_accumulator_m6, approved_native_withdrawal_m6) =
+        apply_transactions(
+            &mut next,
+            &parsed,
+            height,
+            observed_m7,
+            canonical_m6_artifact,
+        )?;
 
     if next.required_activation.is_some()
         && next.active_proposal_hash != Some(next.config.required_proposal_hash)
@@ -734,20 +1688,26 @@ pub fn apply_merkle_bound_elements_slot24_parent_block(
         .checked_add(1)
         .ok_or(ElementsSlot24ReplayError::HeightOverflow)?;
     next.validate()?;
-    *state = next;
-
-    Ok(ElementsSlot24BlockEffects {
-        deposits,
-        bmm_edge,
-        matching_m8_requests,
-        saw_slot24_m7: observed_m7.is_some(),
-        required_proposal_active,
-    })
+    Ok((
+        next,
+        ElementsSlot24BlockEffects {
+            deposits,
+            approved_accumulator_m6,
+            approved_native_withdrawal_m6,
+            bmm_edge,
+            matching_m8_requests,
+            effective_m4,
+            expired_m6ids,
+            saw_slot24_m7: observed_m7.is_some(),
+            required_proposal_active,
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::m6::NATIVE_WITHDRAWAL_REFERENCE_MAGIC;
     use crate::{double_sha256, BitcoinHeader};
 
     fn push(payload: &[u8], nonminimal: bool) -> Vec<u8> {
@@ -763,16 +1723,68 @@ mod tests {
     }
 
     fn m1(description: &[u8]) -> Vec<u8> {
+        m1_for_slot(ELEMENTS_DRIVECHAIN_SLOT, description, false)
+    }
+
+    fn m1_for_slot(slot: u8, description: &[u8], nonminimal: bool) -> Vec<u8> {
         let mut payload = Vec::from(M1_TAG);
-        payload.push(ELEMENTS_DRIVECHAIN_SLOT);
+        payload.push(slot);
         payload.extend_from_slice(description);
-        push(&payload, false)
+        push(&payload, nonminimal)
     }
 
     fn m2(proposal_hash: [u8; 32]) -> Vec<u8> {
+        m2_for_slot(ELEMENTS_DRIVECHAIN_SLOT, proposal_hash, false)
+    }
+
+    fn m2_for_slot(slot: u8, proposal_hash: [u8; 32], nonminimal: bool) -> Vec<u8> {
         let mut payload = Vec::from(M2_TAG);
-        payload.push(ELEMENTS_DRIVECHAIN_SLOT);
+        payload.push(slot);
         payload.extend_from_slice(&proposal_hash);
+        push(&payload, nonminimal)
+    }
+
+    fn m3(m6id: Hash32) -> Vec<u8> {
+        let mut payload = Vec::from(M3_TAG);
+        payload.push(ELEMENTS_DRIVECHAIN_SLOT);
+        let mut wire = m6id.0;
+        wire.reverse();
+        payload.extend_from_slice(&wire);
+        push(&payload, false)
+    }
+
+    fn m3_for_slot(slot: u8, m6id: Hash32) -> Vec<u8> {
+        let mut script = m3(m6id);
+        // Minimal push: OP_RETURN, length, four-byte tag, then slot.
+        script[2 + 4] = slot;
+        script
+    }
+
+    fn m4_one(votes: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::from(M4_TAG);
+        payload.push(1);
+        payload.extend_from_slice(votes);
+        push(&payload, false)
+    }
+
+    fn m4_two(votes: &[u16]) -> Vec<u8> {
+        let mut payload = Vec::from(M4_TAG);
+        payload.push(2);
+        for vote in votes {
+            payload.extend_from_slice(&vote.to_le_bytes());
+        }
+        push(&payload, false)
+    }
+
+    fn m4_repeat() -> Vec<u8> {
+        let mut payload = Vec::from(M4_TAG);
+        payload.push(0);
+        push(&payload, false)
+    }
+
+    fn m4_leading_by_50() -> Vec<u8> {
+        let mut payload = Vec::from(M4_TAG);
+        payload.push(3);
         push(&payload, false)
     }
 
@@ -792,7 +1804,11 @@ mod tests {
     }
 
     fn treasury() -> Vec<u8> {
-        vec![OP_DRIVECHAIN, 1, ELEMENTS_DRIVECHAIN_SLOT, OP_TRUE]
+        treasury_for_slot(ELEMENTS_DRIVECHAIN_SLOT)
+    }
+
+    fn treasury_for_slot(slot: u8) -> Vec<u8> {
+        vec![OP_DRIVECHAIN, 1, slot, OP_TRUE]
     }
 
     fn transaction(
@@ -880,6 +1896,18 @@ mod tests {
         apply_merkle_bound_elements_slot24_parent_block(state, &raw)
     }
 
+    fn apply_with_artifact(
+        state: &mut ElementsSlot24ReplayState,
+        coinbase_outputs: &[Vec<u8>],
+        ordinary: &[Vec<u8>],
+        artifact: &MinerBundleArtifact,
+    ) -> Result<ElementsSlot24BlockEffects, ElementsSlot24ReplayError> {
+        let mut transactions = vec![coinbase(coinbase_outputs)];
+        transactions.extend_from_slice(ordinary);
+        let raw = block(state.tip_hash(), state.next_height(), &transactions);
+        apply_merkle_bound_elements_slot24_parent_block_with_m6_artifact(state, &raw, artifact)
+    }
+
     fn test_state(required_description: &[u8]) -> ElementsSlot24ReplayState {
         let config = ElementsSlot24ReplayConfig::from_manifest_bound_identity(
             double_sha256(required_description),
@@ -904,14 +1932,133 @@ mod tests {
         Ok(())
     }
 
+    fn hash(byte: u8) -> Hash32 {
+        Hash32([byte; 32])
+    }
+
+    fn native_withdrawal_vector() -> NativeWithdrawalM6 {
+        NativeWithdrawalM6::decode_legacy(
+            &usdd_core::decode_hex(concat!(
+                "02000000000300000000000000000a6a0800000000000003e8",
+                "00000000000000004c6a4a",
+                "454c5744013f3e3d3c3b3a393837363534333231302f2e2d2c2b2a29282726252423222120",
+                "185f5e5d5c5b5a595857565554535251504f4e4d4c4b4a4948474645444342414000000007",
+                "b882010000000000160014606162636465666768696a6b6c6d6e6f7071727300000000"
+            ))
+            .expect("native vector hex"),
+        )
+        .expect("canonical Elements native-withdrawal vector")
+    }
+
+    fn accumulator_identity() -> Slot24AccumulatorIdentity {
+        Slot24AccumulatorIdentity {
+            bitcoin_genesis: hash(1),
+            // Explicit cross-language ELWD vector input, not a new production
+            // network pin. The coordinated identity refreeze remains external.
+            elements_genesis: native_withdrawal_vector().reference().elements_genesis(),
+            usdd_asset: hash(3),
+            vault_id: hash(4),
+        }
+    }
+
+    fn bundle_from(prior: Slot24ApprovedRoot, next_byte: u8) -> MinerBundleArtifact {
+        let identity = accumulator_identity();
+        MinerBundleArtifact {
+            bitcoin_genesis: identity.bitcoin_genesis,
+            elements_genesis: identity.elements_genesis,
+            usdd_asset: identity.usdd_asset,
+            vault_id: identity.vault_id,
+            prior_claim_count: prior.claim_count,
+            prior_claim_root: prior.claim_root,
+            next_claim_count: prior.claim_count + 1,
+            next_claim_root: hash(next_byte),
+            fee_sats: 1_000,
+        }
+    }
+
+    fn funded_accumulator_state() -> ElementsSlot24ReplayState {
+        let required = b"elements";
+        let mut state = test_state(required);
+        activate(&mut state, required).expect("activate");
+        let funding = transaction(
+            (BlockHash::from_internal_bytes([0x71; 32]), 0),
+            &[],
+            &[(1_000_000, treasury()), (0, push(b"elements", false))],
+        );
+        apply(&mut state, &[], &[funding]).expect("initial CTIP");
+        state
+            .bind_usdd_accumulator_checkpoint_requires_manifest_binding(
+                accumulator_identity(),
+                Slot24ApprovedRoot::empty(),
+            )
+            .expect("manifest-bound accumulator");
+        state
+    }
+
+    fn actual_m6_bytes(
+        state: &ElementsSlot24ReplayState,
+        artifact: &MinerBundleArtifact,
+    ) -> Vec<u8> {
+        let ctip = state.ctip().expect("funded CTIP");
+        ActualM6Artifact::build(
+            artifact.clone(),
+            Ctip {
+                outpoint: OutPoint {
+                    txid: Hash32(ctip.txid.to_display_bytes()),
+                    vout: ctip.vout,
+                },
+                value_sats: ctip.value_sat,
+            },
+        )
+        .expect("actual M6")
+        .transaction_bytes()
+        .expect("actual bytes")
+    }
+
+    fn native_actual_m6_bytes(
+        state: &ElementsSlot24ReplayState,
+        native: &NativeWithdrawalM6,
+    ) -> Vec<u8> {
+        let ctip = state.ctip().expect("funded CTIP");
+        native
+            .actual_transaction_bytes(&Ctip {
+                outpoint: OutPoint {
+                    txid: Hash32(ctip.txid.to_display_bytes()),
+                    vout: ctip.vout,
+                },
+                value_sats: ctip.value_sat,
+            })
+            .expect("native actual bytes")
+    }
+
+    fn approve_m6id(state: &mut ElementsSlot24ReplayState, m6id: Hash32) {
+        apply(state, &[m3(m6id)], &[]).expect("M3");
+        approve_m6id_from_existing(state, m6id);
+    }
+
+    fn approve_m6id_from_existing(state: &mut ElementsSlot24ReplayState, m6id: Hash32) {
+        for _ in 0..5 {
+            let index = pending_m6_index(state, m6id).expect("M6id pending");
+            assert!(index <= u8::MAX as usize, "test M4 uses one-byte index");
+            apply(state, &[m4_one(&[index as u8])], &[]).expect("M4 upvote");
+        }
+        let pending = state
+            .pending_m6ids()
+            .find(|pending| pending.m6id == m6id)
+            .expect("approved pending M6");
+        assert_eq!(pending.m6id, m6id);
+        assert_eq!(pending.score, SLOT24_M6_REQUIRED_SCORE);
+    }
+
     #[test]
     fn frozen_proposal_hash_matches_elements_identity() {
         let description_hex = concat!(
             "0008456c656d656e7473456c656d656e7473204472697665636861696e207631",
-            "3b206e617469766520555344443b207265706c61792076323b2053696d706c69",
-            "63697479206163746976653b20736c6f74203234a8ec2ac4113afc9f4f964fc2",
-            "7439fd0cab5bb556b050a98e62e0a027ac2f5066f49d0cbac06d5a79012d6dc3",
-            "43d96b5181a1d00d"
+            "3b206e617469766520555344443b207265706c61792076343b206f6e65204d36",
+            "2070657220706172656e7420626c6f636b3b207769746864726177616c206163",
+            "63756d756c61746f722076313b2053696d706c6963697479206163746976653b",
+            "20736c6f74203234f29aa8f8f41516ea0aa9845173f3d0d30144d4493495e749",
+            "891310d419f4cf59d0552b4c7cacc18ce49532f6cb09fc877f56bafe"
         );
         let description = description_hex
             .as_bytes()
@@ -932,12 +2079,155 @@ mod tests {
     }
 
     #[test]
+    fn complete_non_slot24_m1_m2_m3_reject_the_whole_block_atomically() {
+        let mut state = test_state(b"elements");
+        let before = state.clone();
+        let cases = [
+            (
+                m1_for_slot(23, b"another-drivechain", false),
+                ElementsSlot24ReplayError::M1ForUnsupportedSlot,
+            ),
+            // The enforcer accepts non-minimal data pushes at this layer, so
+            // the sole-slot preflight must recognize and reject this too.
+            (
+                m1_for_slot(23, b"", true),
+                ElementsSlot24ReplayError::M1ForUnsupportedSlot,
+            ),
+            (
+                m2_for_slot(23, [0x22; 32], false),
+                ElementsSlot24ReplayError::M2ForUnsupportedSlot,
+            ),
+            (
+                m3_for_slot(23, hash(0x33)),
+                ElementsSlot24ReplayError::M3ForUnsupportedSlot,
+            ),
+        ];
+        for (script, error) in cases {
+            assert_eq!(apply(&mut state, &[script], &[]), Err(error));
+            assert_eq!(state, before, "rejected block must not mutate replay state");
+        }
+    }
+
+    #[test]
+    fn malformed_or_non_coinbase_other_slot_messages_remain_ordinary_data() {
+        // Missing M1's mandatory sidechain byte.
+        let short_m1 = push(&M1_TAG, false);
+
+        let mut short_m2 = Vec::from(M2_TAG);
+        short_m2.push(23);
+        short_m2.extend_from_slice(&[0x42; 31]);
+        let short_m2 = push(&short_m2, false);
+
+        let mut long_m3 = Vec::from(M3_TAG);
+        long_m3.push(23);
+        long_m3.extend_from_slice(&[0x43; 33]);
+        let long_m3 = push(&long_m3, false);
+
+        // A complete push followed by another instruction is not a coinbase
+        // message in the checked-in enforcer.
+        let mut trailing_instruction = m2_for_slot(23, [0x44; 32], false);
+        trailing_instruction.push(OP_TRUE);
+
+        let mut state = test_state(b"elements");
+        apply(
+            &mut state,
+            &[short_m1, short_m2, long_m3, trailing_instruction],
+            &[],
+        )
+        .expect("malformed tag-like scripts are ordinary coinbase outputs");
+
+        // Message parsing is coinbase-only. The same complete M1 shape in an
+        // ordinary transaction output must not be treated as activation data.
+        let ordinary = transaction(
+            (BlockHash::from_internal_bytes([0x51; 32]), 0),
+            &[],
+            &[(0, m1_for_slot(23, b"ordinary-output", false))],
+        );
+        apply(&mut state, &[], &[ordinary])
+            .expect("message-shaped non-coinbase output is ordinary data");
+        assert_eq!(state.active_proposal_hash(), None);
+        assert_eq!(state.pending_proposals().len(), 0);
+    }
+
+    #[test]
+    fn rejected_other_slots_cannot_change_the_single_entry_m4_vector() {
+        let mut state = test_state(b"elements");
+        let before = state.clone();
+        assert_eq!(
+            apply(
+                &mut state,
+                &[m1_for_slot(7, b"would-shift-m4-index", false)],
+                &[],
+            ),
+            Err(ElementsSlot24ReplayError::M1ForUnsupportedSlot)
+        );
+        assert_eq!(state, before);
+
+        activate(&mut state, b"elements").expect("activate sole slot 24");
+        apply(&mut state, &[m3(hash(0x61))], &[]).expect("slot-24 M3");
+        let before = state.clone();
+        assert_eq!(
+            apply(&mut state, &[m4_one(&[0, 0xff])], &[]),
+            Err(ElementsSlot24ReplayError::M4InvalidVoteCount)
+        );
+        assert_eq!(state, before);
+        apply(&mut state, &[m4_one(&[0])], &[]).expect("exact one-slot vote vector");
+    }
+
+    #[test]
+    fn inactive_other_slot_treasury_shapes_do_not_change_slot24_ctip() {
+        let mut state = funded_accumulator_state();
+        let original_ctip = state.ctip().expect("slot-24 CTIP");
+
+        let unrelated_other_slot = transaction(
+            (BlockHash::from_internal_bytes([0x62; 32]), 0),
+            &[],
+            &[(123, treasury_for_slot(23))],
+        );
+        let effects = apply(&mut state, &[], &[unrelated_other_slot])
+            .expect("inactive other-slot treasury shape is ordinary");
+        assert!(effects.deposits.is_empty());
+        assert_eq!(state.ctip(), Some(original_ctip));
+
+        // An inactive other-slot treasury-shaped output may coexist with a
+        // real slot-24 M5 without changing its classification or vout.
+        let mixed_m5 = transaction(
+            (original_ctip.txid, original_ctip.vout),
+            &[],
+            &[
+                (original_ctip.value_sat + 1_000, treasury()),
+                (0, push(b"elements-recipient", false)),
+                (321, treasury_for_slot(23)),
+            ],
+        );
+        let effects = apply(&mut state, &[], &[mixed_m5]).expect("slot-24 M5");
+        assert_eq!(effects.deposits.len(), 1);
+        assert_eq!(effects.deposits[0].value_sat, 1_000);
+        assert_eq!(state.ctip().expect("successor CTIP").vout, 0);
+
+        // Conversely, an other-slot shape is never a replacement for a spent
+        // slot-24 CTIP.
+        let current = state.ctip().expect("current slot-24 CTIP");
+        let missing_slot24_replacement = transaction(
+            (current.txid, current.vout),
+            &[],
+            &[(current.value_sat, treasury_for_slot(23))],
+        );
+        let before = state.clone();
+        assert_eq!(
+            apply(&mut state, &[], &[missing_slot24_replacement]),
+            Err(ElementsSlot24ReplayError::CtipSpentWithoutReplacement)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn pending_proposal_bound_is_derived_from_block_weight_and_age() {
         let config = ElementsSlot24ReplayConfig::elements_v1();
         assert_eq!(ELEMENTS_V1_MAX_LIVE_PROPOSAL_BLOCKS, 11);
         assert_eq!(
             MAX_PENDING_SLOT24_PROPOSALS,
-            BITCOIN_MAX_COINBASE_OUTPUTS * 11
+            BITCOIN_MAX_COINBASE_OUTPUTS * 12
         );
         let derived = config.maximum_pending_proposals().expect("derived bound");
         assert_eq!(derived, MAX_PENDING_SLOT24_PROPOSALS);
@@ -1057,6 +2347,643 @@ mod tests {
     }
 
     #[test]
+    fn ordered_m3_m4_votes_match_short_enforcer_semantics() {
+        let mut state = funded_accumulator_state();
+        let a = hash(0xa1);
+        let b = hash(0xb2);
+        let proposal_height = state.next_height();
+        let proposed = apply(&mut state, &[m3(a), m3(b)], &[]).expect("competing M3s");
+        assert_eq!(proposed.effective_m4, None);
+        assert_eq!(
+            state.pending_m6ids().collect::<Vec<_>>(),
+            vec![
+                PendingSlot24M6id {
+                    m6id: a,
+                    proposal_height,
+                    score: 1,
+                },
+                PendingSlot24M6id {
+                    m6id: b,
+                    proposal_height,
+                    score: 1,
+                },
+            ]
+        );
+
+        let upvote = apply(&mut state, &[m4_one(&[0])], &[]).expect("upvote first");
+        assert_eq!(
+            upvote.effective_m4,
+            Some(EffectiveSlot24M4::Upvote { m6id: a })
+        );
+        assert_eq!(
+            state.pending_m6ids().map(|p| p.score).collect::<Vec<_>>(),
+            vec![2, 0]
+        );
+
+        let repeat = apply(&mut state, &[m4_repeat()], &[]).expect("repeat effective upvote");
+        assert_eq!(
+            repeat.effective_m4,
+            Some(EffectiveSlot24M4::Upvote { m6id: a })
+        );
+        assert_eq!(
+            state.pending_m6ids().map(|p| p.score).collect::<Vec<_>>(),
+            vec![3, 0]
+        );
+
+        let alarm = apply(&mut state, &[m4_one(&[0xfe])], &[]).expect("alarm");
+        assert_eq!(alarm.effective_m4, Some(EffectiveSlot24M4::Alarm));
+        assert_eq!(
+            state.pending_m6ids().map(|p| p.score).collect::<Vec<_>>(),
+            vec![2, 0]
+        );
+        apply(&mut state, &[m4_repeat()], &[]).expect("repeat alarm");
+        assert_eq!(
+            state.pending_m6ids().map(|p| p.score).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        // An absent M4 is the enforcer's implicit abstain and clears the
+        // effective action available to the next block's RepeatPrevious.
+        apply(&mut state, &[], &[]).expect("implicit abstain");
+        let unchanged = state.clone();
+        let repeated_abstain = apply(&mut state, &[m4_repeat()], &[]).expect("repeat abstain");
+        assert_eq!(repeated_abstain.effective_m4, None);
+        assert_eq!(
+            state.pending_m6ids().collect::<Vec<_>>(),
+            unchanged.pending_m6ids().collect::<Vec<_>>()
+        );
+
+        state.pending_m6ids[0].score = 51;
+        state.pending_m6ids[1].score = 1;
+        let leading = apply(&mut state, &[m4_leading_by_50()], &[]).expect("leading by 50");
+        assert_eq!(
+            leading.effective_m4,
+            Some(EffectiveSlot24M4::Upvote { m6id: a })
+        );
+        assert_eq!(
+            state.pending_m6ids().map(|p| p.score).collect::<Vec<_>>(),
+            vec![52, 0]
+        );
+    }
+
+    #[test]
+    fn m3_m4_order_duplicates_encodings_and_expiry_fail_closed() {
+        let mut state = funded_accumulator_state();
+        let a = hash(0xa3);
+        let before = state.clone();
+        assert_eq!(
+            apply(&mut state, &[m4_one(&[0]), m3(a)], &[]),
+            Err(ElementsSlot24ReplayError::M4UpvoteMissingBundle)
+        );
+        assert_eq!(state, before);
+
+        // Reversing the two coinbase outputs makes the index valid and starts
+        // score 1 before the same-block M4 raises it to 2.
+        apply(&mut state, &[m3(a), m4_one(&[0])], &[]).expect("ordered M3 then M4");
+        assert_eq!(state.pending_m6ids().next().expect("pending").score, 2);
+
+        for (scripts, error) in [
+            (
+                vec![m4_one(&[0xff]), m4_repeat()],
+                ElementsSlot24ReplayError::DuplicateM4,
+            ),
+            (
+                vec![m3(a)],
+                ElementsSlot24ReplayError::M3BundleAlreadyPending,
+            ),
+            (
+                vec![m3_for_slot(23, hash(9))],
+                ElementsSlot24ReplayError::M3ForUnsupportedSlot,
+            ),
+            (
+                vec![m4_two(&[0])],
+                ElementsSlot24ReplayError::M4TwoBytesWithinByteRange,
+            ),
+            (
+                vec![m4_two(&[254])],
+                ElementsSlot24ReplayError::M4UpvoteMissingBundle,
+            ),
+        ] {
+            let before = state.clone();
+            assert_eq!(apply(&mut state, &scripts, &[]), Err(error));
+            assert_eq!(state, before);
+        }
+
+        let proposal_height = state
+            .pending_m6ids()
+            .next()
+            .expect("pending")
+            .proposal_height;
+        while state.next_height() <= proposal_height + u32::from(SLOT24_M6_MAX_AGE) {
+            apply(&mut state, &[], &[]).expect("live through age ten");
+        }
+        assert_eq!(state.pending_m6ids().len(), 1);
+        let expiry = apply(&mut state, &[], &[]).expect("expires at age eleven");
+        assert_eq!(expiry.expired_m6ids, vec![a]);
+        assert_eq!(state.pending_m6ids().len(), 0);
+        apply(&mut state, &[m3(a)], &[]).expect("reproposal after expiry is fresh");
+        assert_eq!(state.pending_m6ids().next().expect("fresh").score, 1);
+    }
+
+    #[test]
+    fn exact_native_elwd_m6_rotates_ctip_and_preserves_usdd_root() {
+        let mut state = funded_accumulator_state();
+        let native = native_withdrawal_vector();
+        assert_eq!(
+            native.m6id().to_string(),
+            "a7e1da09da7c62eda3f3bcb3902d6a79bb1d4a348858346c4152c10b714d3572"
+        );
+        assert_eq!(
+            native.reference().elements_genesis(),
+            accumulator_identity().elements_genesis
+        );
+        approve_m6id(&mut state, native.m6id());
+
+        let prior_root = state.approved_root().expect("root");
+        let prior_ctip = state.ctip().expect("CTIP");
+        let actual = native_actual_m6_bytes(&state, &native);
+        let effects = apply(&mut state, &[], &[actual]).expect("approved native M6");
+        let approved = effects
+            .approved_native_withdrawal_m6
+            .expect("native approval effect");
+        assert!(effects.approved_accumulator_m6.is_none());
+        assert_eq!(approved.m6id, native.m6id());
+        assert_eq!(approved.preserved_usdd_root, prior_root);
+        assert_eq!(state.approved_root(), Some(prior_root));
+        assert_eq!(approved.burn_outpoint, native.reference().burn_outpoint());
+        assert_eq!(approved.parent_fee_sats, 1_000);
+        assert_eq!(approved.payout_sats, 99_000);
+        assert_eq!(state.ctip().expect("successor CTIP").vout, 0);
+        assert_eq!(
+            prior_ctip.value_sat - state.ctip().expect("successor CTIP").value_sat,
+            approved.parent_fee_sats + approved.payout_sats
+        );
+        assert!(state
+            .pending_m6ids()
+            .all(|pending| pending.m6id != native.m6id()));
+        assert!(state.successful_m6ids().any(|m6id| m6id == native.m6id()));
+
+        // Match upstream: a paid M6id may be proposed again. The bridge keeps
+        // the prior success only as audit history, while the new proposal
+        // re-enters the ordered M4 set with score one.
+        apply(&mut state, &[m3(native.m6id())], &[])
+            .expect("upstream permits reproposing a paid M6id");
+        assert!(state
+            .pending_m6ids()
+            .any(|pending| pending.m6id == native.m6id()));
+    }
+
+    #[test]
+    fn native_elwd_marker_aliases_wrong_identity_and_auxiliary_ambiguity_fail_closed() {
+        let mut state = funded_accumulator_state();
+        let native = native_withdrawal_vector();
+        let actual = native_actual_m6_bytes(&state, &native);
+        let baseline = state.clone();
+
+        assert_eq!(
+            apply(&mut state, &[], core::slice::from_ref(&actual)),
+            Err(ElementsSlot24ReplayError::NativeWithdrawalM6NotPending)
+        );
+        assert_eq!(state, baseline);
+
+        let marker_offset = actual
+            .windows(NATIVE_WITHDRAWAL_REFERENCE_MAGIC.len())
+            .position(|window| window == NATIVE_WITHDRAWAL_REFERENCE_MAGIC)
+            .expect("actual ELWD marker");
+        let mut wrong_magic = actual.clone();
+        wrong_magic[marker_offset] ^= 1;
+        assert_eq!(
+            apply(&mut state, &[], &[wrong_magic]),
+            Err(ElementsSlot24ReplayError::UnknownSlot24M6)
+        );
+        assert_eq!(state, baseline);
+
+        let mut wrong_version = actual.clone();
+        wrong_version[0] = 1;
+        assert_eq!(
+            apply(&mut state, &[], &[wrong_version]),
+            Err(ElementsSlot24ReplayError::UnknownSlot24M6)
+        );
+        assert_eq!(state, baseline);
+
+        let mut wrong_genesis = actual.clone();
+        wrong_genesis[marker_offset + 5..marker_offset + 37].reverse();
+        assert_eq!(
+            apply(&mut state, &[], &[wrong_genesis]),
+            Err(ElementsSlot24ReplayError::NativeWithdrawalIdentityMismatch)
+        );
+        assert_eq!(state, baseline);
+
+        let ctip = state.ctip().expect("CTIP");
+        let marker_only = transaction(
+            (ctip.txid, ctip.vout),
+            &[],
+            &[
+                (ctip.value_sat - 1, treasury()),
+                (0, push(b"ELWD\x01marker-only", false)),
+            ],
+        );
+        assert_eq!(
+            apply(&mut state, &[], &[marker_only]),
+            Err(ElementsSlot24ReplayError::UnknownSlot24M6)
+        );
+        assert_eq!(state, baseline);
+
+        approve_m6id(&mut state, native.m6id());
+        let approved_state = state.clone();
+        let actual = native_actual_m6_bytes(&state, &native);
+        let unrelated_artifact = bundle_from(state.approved_root().unwrap(), 0xd1);
+        assert_eq!(
+            apply_with_artifact(&mut state, &[], &[actual], &unrelated_artifact),
+            Err(ElementsSlot24ReplayError::AmbiguousSlot24M6)
+        );
+        assert_eq!(state, approved_state);
+    }
+
+    #[test]
+    fn native_elwd_connect_disconnect_reorg_and_replay_are_root_safe() {
+        let mut branch_point = funded_accumulator_state();
+        let native = native_withdrawal_vector();
+        let artifact = bundle_from(branch_point.approved_root().unwrap(), 0xd2);
+        let height = branch_point.next_height() - 1;
+        branch_point.pending_m6ids = vec![
+            PendingSlot24M6id {
+                m6id: native.m6id(),
+                proposal_height: height,
+                score: SLOT24_M6_REQUIRED_SCORE,
+            },
+            PendingSlot24M6id {
+                m6id: artifact.m6id().unwrap(),
+                proposal_height: height,
+                score: SLOT24_M6_REQUIRED_SCORE,
+            },
+        ];
+        branch_point.validate().expect("branch checkpoint");
+        let native_actual = native_actual_m6_bytes(&branch_point, &native);
+        let canonical_actual = actual_m6_bytes(&branch_point, &artifact);
+        let prior_root = branch_point.approved_root().unwrap();
+
+        let mut native_branch = branch_point.clone();
+        apply(
+            &mut native_branch,
+            &[],
+            core::slice::from_ref(&native_actual),
+        )
+        .expect("connect native branch");
+        assert_eq!(native_branch.approved_root(), Some(prior_root));
+
+        // Disconnect is represented by restoring the immutable predecessor
+        // snapshot. Applying the sibling proves neither child mutated it.
+        let disconnected = branch_point.clone();
+        let mut canonical_branch = disconnected.clone();
+        apply_with_artifact(
+            &mut canonical_branch,
+            &[],
+            core::slice::from_ref(&canonical_actual),
+            &artifact,
+        )
+        .expect("connect canonical sibling");
+        assert_eq!(disconnected, branch_point);
+        assert_eq!(native_branch.approved_root(), Some(prior_root));
+        assert_eq!(
+            canonical_branch.approved_root(),
+            Some(Slot24ApprovedRoot {
+                claim_count: artifact.next_claim_count,
+                claim_root: artifact.next_claim_root,
+            })
+        );
+        assert_ne!(native_branch.tip_hash(), canonical_branch.tip_hash());
+        assert_ne!(native_branch.ctip(), canonical_branch.ctip());
+
+        let paid_state = native_branch.clone();
+        assert_eq!(
+            apply(
+                &mut native_branch,
+                &[],
+                core::slice::from_ref(&native_actual)
+            ),
+            Err(ElementsSlot24ReplayError::ParallelTreasuryOutput)
+        );
+        assert_eq!(native_branch, paid_state, "paid M6 replay is atomic");
+    }
+
+    #[test]
+    fn native_elwd_expiry_byte_order_zero_ctip_and_bridge_multi_m6_policy() {
+        let native = native_withdrawal_vector();
+
+        let script = m3(native.m6id());
+        let mut expected_wire = native.m6id().0;
+        expected_wire.reverse();
+        assert_eq!(&script[7..39], &expected_wire);
+
+        let mut wrong_order_state = funded_accumulator_state();
+        let mut wrong_order_m3 = script;
+        wrong_order_m3[7..39].copy_from_slice(native.m6id().as_bytes());
+        apply(&mut wrong_order_state, &[wrong_order_m3], &[]).expect("wrong-order M3 parses");
+        let wrong_order_before = wrong_order_state.clone();
+        let actual = native_actual_m6_bytes(&wrong_order_state, &native);
+        assert_eq!(
+            apply(&mut wrong_order_state, &[], &[actual]),
+            Err(ElementsSlot24ReplayError::NativeWithdrawalM6NotPending)
+        );
+        assert_eq!(wrong_order_state, wrong_order_before);
+
+        let mut expired_state = funded_accumulator_state();
+        apply(&mut expired_state, &[m3(native.m6id())], &[]).expect("native M3");
+        let mut expired = Vec::new();
+        for _ in 0..=SLOT24_M6_MAX_AGE + 1 {
+            expired.extend(
+                apply(&mut expired_state, &[], &[])
+                    .expect("age native M6")
+                    .expired_m6ids,
+            );
+        }
+        assert_eq!(expired, vec![native.m6id()]);
+        let expired_before = expired_state.clone();
+        let actual = native_actual_m6_bytes(&expired_state, &native);
+        assert_eq!(
+            apply(&mut expired_state, &[], &[actual]),
+            Err(ElementsSlot24ReplayError::NativeWithdrawalM6NotPending)
+        );
+        assert_eq!(expired_state, expired_before);
+
+        let mut zero_state = funded_accumulator_state();
+        let mut draining_bytes = native.legacy_bytes();
+        let fee_marker = draining_bytes
+            .windows(2)
+            .position(|window| window == [OP_RETURN, 8])
+            .expect("fee push");
+        draining_bytes[fee_marker + 2..fee_marker + 10].copy_from_slice(&901_000u64.to_be_bytes());
+        let draining = NativeWithdrawalM6::decode_legacy(&draining_bytes).unwrap();
+        approve_m6id(&mut zero_state, draining.m6id());
+        let zero_root = zero_state.approved_root();
+        let actual = native_actual_m6_bytes(&zero_state, &draining);
+        apply(&mut zero_state, &[], &[actual]).expect("zero-valued successor CTIP");
+        assert_eq!(zero_state.ctip().unwrap().value_sat, 0);
+        assert_eq!(zero_state.approved_root(), zero_root);
+
+        let mut multiple_state = funded_accumulator_state();
+        let first = native;
+        let mut second_bytes = first.legacy_bytes();
+        let marker = second_bytes
+            .windows(NATIVE_WITHDRAWAL_REFERENCE_MAGIC.len())
+            .position(|window| window == NATIVE_WITHDRAWAL_REFERENCE_MAGIC)
+            .unwrap();
+        second_bytes[marker + 70..marker + 74].copy_from_slice(&8u32.to_be_bytes());
+        let second = NativeWithdrawalM6::decode_legacy(&second_bytes).unwrap();
+        let height = multiple_state.next_height() - 1;
+        multiple_state.pending_m6ids = vec![
+            PendingSlot24M6id {
+                m6id: first.m6id(),
+                proposal_height: height,
+                score: SLOT24_M6_REQUIRED_SCORE,
+            },
+            PendingSlot24M6id {
+                m6id: second.m6id(),
+                proposal_height: height,
+                score: SLOT24_M6_REQUIRED_SCORE,
+            },
+        ];
+        multiple_state.validate().unwrap();
+        let prior = Ctip {
+            outpoint: OutPoint {
+                txid: Hash32(multiple_state.ctip().unwrap().txid.to_display_bytes()),
+                vout: multiple_state.ctip().unwrap().vout,
+            },
+            value_sats: multiple_state.ctip().unwrap().value_sat,
+        };
+        let first_actual = first.actual_transaction_bytes(&prior).unwrap();
+        let second_actual = second
+            .actual_transaction_bytes(&first.successor_ctip(&prior).unwrap())
+            .unwrap();
+        let multiple_before = multiple_state.clone();
+        assert_eq!(
+            apply(&mut multiple_state, &[], &[first_actual, second_actual]),
+            Err(ElementsSlot24ReplayError::MultipleSuccessfulSlot24M6s)
+        );
+        assert_eq!(multiple_state, multiple_before);
+    }
+
+    #[test]
+    fn canonical_accumulator_m6_requires_exact_approval_transaction_and_root() {
+        let mut state = funded_accumulator_state();
+        let prior = state.approved_root().expect("root");
+        let artifact = bundle_from(prior, 0x91);
+        let m6id = artifact.m6id().expect("M6id");
+        approve_m6id(&mut state, m6id);
+
+        // A competing M3 is allowed and must remain pending after the approved
+        // canonical artifact consumes only its own M6id.
+        let competitor = hash(0xc1);
+        apply(&mut state, &[m3(competitor)], &[]).expect("competing M3");
+        let prior_ctip = state.ctip().expect("CTIP");
+        let actual = actual_m6_bytes(&state, &artifact);
+        let effects = apply_with_artifact(&mut state, &[], &[actual], &artifact)
+            .expect("approved canonical actual M6");
+        let approved = effects.approved_accumulator_m6.expect("approval event");
+        assert_eq!(approved.m6id, m6id);
+        assert_eq!(approved.prior_root, prior);
+        assert_eq!(approved.next_root.claim_count, 1);
+        assert_eq!(approved.next_root.claim_root, hash(0x91));
+        assert_eq!(state.approved_root(), Some(approved.next_root));
+        assert_eq!(
+            prior_ctip.value_sat - state.ctip().expect("successor").value_sat,
+            artifact.fee_sats + M6_ROOT_PAYOUT_SATS
+        );
+        assert_eq!(state.ctip().expect("successor").vout, 0);
+        assert_eq!(
+            state
+                .pending_m6ids()
+                .map(|pending| pending.m6id)
+                .collect::<Vec<_>>(),
+            vec![competitor]
+        );
+        assert!(state
+            .successful_m6ids()
+            .any(|successful| successful == m6id));
+        apply(&mut state, &[m3(m6id)], &[])
+            .expect("upstream permits reproposing a paid accumulator M6id");
+        assert!(state.pending_m6ids().any(|pending| pending.m6id == m6id));
+    }
+
+    #[test]
+    fn canonical_m6_failures_and_forks_leave_prior_state_unchanged() {
+        let mut state = funded_accumulator_state();
+        let artifact = bundle_from(state.approved_root().expect("root"), 0x92);
+        let m6id = artifact.m6id().expect("M6id");
+        let actual = actual_m6_bytes(&state, &artifact);
+        let without_m3 = state.clone();
+        assert_eq!(
+            apply_with_artifact(&mut state, &[], core::slice::from_ref(&actual), &artifact,),
+            Err(ElementsSlot24ReplayError::CanonicalM6NotPending)
+        );
+        assert_eq!(state, without_m3);
+
+        apply(&mut state, &[m3(m6id)], &[]).expect("M3 score one");
+        let before = state.clone();
+        assert_eq!(
+            apply_with_artifact(&mut state, &[], core::slice::from_ref(&actual), &artifact),
+            Err(ElementsSlot24ReplayError::CanonicalM6InsufficientScore)
+        );
+        assert_eq!(state, before);
+
+        for _ in 0..4 {
+            apply(&mut state, &[m4_one(&[0])], &[]).expect("score to threshold");
+        }
+        assert_eq!(state.pending_m6ids().next().expect("pending").score, 5);
+        let at_threshold = state.clone();
+        assert_eq!(
+            apply_with_artifact(&mut state, &[], core::slice::from_ref(&actual), &artifact,),
+            Err(ElementsSlot24ReplayError::CanonicalM6InsufficientScore)
+        );
+        assert_eq!(state, at_threshold);
+        apply(&mut state, &[m4_one(&[0])], &[]).expect("strictly above threshold");
+        assert_eq!(state.pending_m6ids().next().expect("pending").score, 6);
+        let branch_point = state.clone();
+        assert_eq!(
+            apply_with_artifact(&mut state, &[], &[], &artifact),
+            Err(ElementsSlot24ReplayError::UnexpectedCanonicalM6Artifact)
+        );
+        assert_eq!(state, branch_point);
+
+        let mut invalid_identity = artifact.clone();
+        invalid_identity.vault_id = hash(0x44);
+        assert_eq!(
+            apply_with_artifact(
+                &mut state,
+                &[],
+                core::slice::from_ref(&actual),
+                &invalid_identity,
+            ),
+            Err(ElementsSlot24ReplayError::CanonicalM6IdentityMismatch)
+        );
+        assert_eq!(state, branch_point);
+
+        let mut wrong_prior = artifact.clone();
+        wrong_prior.prior_claim_count = 1;
+        wrong_prior.prior_claim_root = hash(0x55);
+        wrong_prior.next_claim_count = 2;
+        assert_eq!(
+            apply_with_artifact(
+                &mut state,
+                &[],
+                core::slice::from_ref(&actual),
+                &wrong_prior,
+            ),
+            Err(ElementsSlot24ReplayError::CanonicalM6RootMismatch)
+        );
+        assert_eq!(state, branch_point);
+
+        let mut tampered = actual.clone();
+        let value_offset = 4 + 1 + 32 + 4 + 1 + 4 + 1;
+        tampered[value_offset] ^= 1;
+        assert_eq!(
+            apply_with_artifact(&mut state, &[], &[tampered], &artifact),
+            Err(ElementsSlot24ReplayError::CanonicalM6TransactionMismatch)
+        );
+        assert_eq!(state, branch_point);
+
+        let mut canonical_branch = branch_point.clone();
+        apply_with_artifact(&mut canonical_branch, &[], &[actual], &artifact)
+            .expect("canonical branch");
+        let mut sibling_branch = branch_point.clone();
+        apply(&mut sibling_branch, &[], &[]).expect("sibling branch");
+        assert_ne!(canonical_branch, sibling_branch);
+        assert_eq!(
+            state, branch_point,
+            "fork clones must not mutate their parent"
+        );
+    }
+
+    #[test]
+    fn canonical_m6_never_authorizes_a_different_slot24_sidechain_identity() {
+        let mut state = test_state(b"required-elements-identity");
+        activate(&mut state, b"different-slot24-sidechain").expect("activate other identity");
+        assert!(!state.required_proposal_is_active());
+        let funding = transaction(
+            (BlockHash::from_internal_bytes([0x72; 32]), 0),
+            &[],
+            &[(50_000, treasury()), (0, push(b"other", false))],
+        );
+        apply(&mut state, &[], &[funding]).expect("generic slot24 CTIP");
+        state
+            .bind_usdd_accumulator_checkpoint_requires_manifest_binding(
+                accumulator_identity(),
+                Slot24ApprovedRoot::empty(),
+            )
+            .expect("manifest accumulator");
+        let artifact = bundle_from(state.approved_root().expect("root"), 0x95);
+        let m6id = artifact.m6id().expect("M6id");
+        approve_m6id(&mut state, m6id);
+        let actual = actual_m6_bytes(&state, &artifact);
+        let before = state.clone();
+        assert_eq!(
+            apply_with_artifact(&mut state, &[], &[actual], &artifact),
+            Err(ElementsSlot24ReplayError::RequiredProposalInactiveForM6)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn second_accumulator_m6_in_one_parent_block_rejects_atomically() {
+        let mut state = funded_accumulator_state();
+        let first_bundle = bundle_from(state.approved_root().expect("root"), 0x93);
+        let first_next = Slot24ApprovedRoot {
+            claim_count: first_bundle.next_claim_count,
+            claim_root: first_bundle.next_claim_root,
+        };
+        let second_bundle = bundle_from(first_next, 0x94);
+        let first_actual = ActualM6Artifact::build(
+            first_bundle.clone(),
+            Ctip {
+                outpoint: OutPoint {
+                    txid: Hash32(state.ctip().expect("CTIP").txid.to_display_bytes()),
+                    vout: state.ctip().expect("CTIP").vout,
+                },
+                value_sats: state.ctip().expect("CTIP").value_sat,
+            },
+        )
+        .expect("first actual");
+        let second_actual = ActualM6Artifact::build(
+            second_bundle.clone(),
+            first_actual.successor_ctip().expect("first successor"),
+        )
+        .expect("second actual");
+
+        // A complete checkpoint can contain competing positive scores. The
+        // parent-block policy still accepts no sequential second accumulator
+        // spend, even when it would otherwise be canonical.
+        let height = state.next_height() - 1;
+        state.pending_m6ids = vec![
+            PendingSlot24M6id {
+                m6id: first_bundle.m6id().expect("first id"),
+                proposal_height: height,
+                score: SLOT24_M6_REQUIRED_SCORE,
+            },
+            PendingSlot24M6id {
+                m6id: second_bundle.m6id().expect("second id"),
+                proposal_height: height,
+                score: SLOT24_M6_REQUIRED_SCORE,
+            },
+        ];
+        state.validate().expect("bounded checkpoint");
+        let before = state.clone();
+        assert_eq!(
+            apply_with_artifact(
+                &mut state,
+                &[],
+                &[
+                    first_actual.transaction_bytes().expect("first bytes"),
+                    second_actual.transaction_bytes().expect("second bytes"),
+                ],
+                &first_bundle,
+            ),
+            Err(ElementsSlot24ReplayError::MultipleSuccessfulSlot24M6s)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn fabricated_ctip_transitions_are_rejected_atomically() {
         // Mirrors `drivechain_parent_ctip_replay_rejects_fabricated_transitions`.
         let required = b"elements";
@@ -1089,7 +3016,7 @@ mod tests {
         );
         assert_eq!(
             apply(&mut state, &[], &[decrease]),
-            Err(ElementsSlot24ReplayError::CtipDecreaseUnsupported)
+            Err(ElementsSlot24ReplayError::UnknownSlot24M6)
         );
         assert_eq!(state, before);
 
@@ -1125,6 +3052,26 @@ mod tests {
                     votes: 0,
                 }],
                 None,
+            ),
+            Err(ElementsSlot24ReplayError::MalformedState)
+        );
+
+        let checkpoint = funded_accumulator_state();
+        let duplicate_success = hash(0xd1);
+        assert_eq!(
+            ElementsSlot24ReplayState::from_unverified_usdd_checkpoint_requires_manifest_binding(
+                checkpoint.config,
+                checkpoint.next_height - 1,
+                checkpoint.tip_hash,
+                checkpoint.active_proposal_hash,
+                checkpoint.required_activation,
+                checkpoint.pending_proposals.values().cloned().collect(),
+                checkpoint.ctip,
+                checkpoint.pending_m6ids.clone(),
+                vec![duplicate_success, duplicate_success],
+                checkpoint.previous_effective_m4,
+                checkpoint.accumulator_identity.expect("identity"),
+                checkpoint.approved_root.expect("root"),
             ),
             Err(ElementsSlot24ReplayError::MalformedState)
         );

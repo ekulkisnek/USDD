@@ -137,16 +137,18 @@ pub const DOMAIN_SEPARATOR_TABLE_V1: &str = concat!(
     "USDD/1/merkle-node\n",
     "USDD/1/manifest\n",
     "USDD/1/controller-config\n",
-    "USDD/1/outbound-verifier-config\n",
+    "USDD/1/inbound-mint\n",
     "USDD/1/claim/ethereum-state\n",
-    "USDD/1/claim/elements-event\n",
+    "USDD/1/claim/bip300-redemption-approval\n",
     "USDD/1/public/deposit\n",
     "keccak256:USDD_VAULT_ID_V1\n",
     "keccak256:USDD_DEPOSIT_ID_V1\n",
-    "keccak256:USDD_ELEMENTS_STATE_V1\n",
-    "keccak256:USDD_ELEMENTS_STATEMENT_V1\n",
-    "keccak256:USDD_BURN_LEAF_V1\n",
+    "keccak256:USDD_BIP300_REDEMPTION_STATE_V1\n",
+    "keccak256:USDD_BIP300_REDEMPTION_STATEMENT_V1\n",
+    "keccak256:USDD_BIP300_REDEMPTION_LEAF_V1\n",
+    "keccak256:USDD_BITCOIN_BIP300_RELAY_CONFIG_V1\n",
     "sha256:USDD_BURN_ID_V1\n",
+    "sha256:USDD_M6_APPROVED_ROOT_V1\n",
 );
 
 pub fn domain_separator_table_hash() -> Hash32 {
@@ -178,9 +180,9 @@ pub enum Domain {
     MerkleNode,
     Manifest,
     ControllerConfig,
-    OutboundVerifierConfig,
+    InboundMint,
     EthereumStateClaim,
-    ElementsEventClaim,
+    Bip300RedemptionApprovalClaim,
     DepositPublicOutput,
 }
 
@@ -192,9 +194,9 @@ impl Domain {
             Self::MerkleNode => "USDD/1/merkle-node",
             Self::Manifest => "USDD/1/manifest",
             Self::ControllerConfig => "USDD/1/controller-config",
-            Self::OutboundVerifierConfig => "USDD/1/outbound-verifier-config",
+            Self::InboundMint => "USDD/1/inbound-mint",
             Self::EthereumStateClaim => "USDD/1/claim/ethereum-state",
-            Self::ElementsEventClaim => "USDD/1/claim/elements-event",
+            Self::Bip300RedemptionApprovalClaim => "USDD/1/claim/bip300-redemption-approval",
             Self::DepositPublicOutput => "USDD/1/public/deposit",
         }
     }
@@ -218,10 +220,22 @@ mod tests {
     }
 
     #[test]
+    fn inbound_mint_domain_fixed_vector() {
+        assert_eq!(
+            domain_hash(Domain::InboundMint, &[0x44; 32]).to_string(),
+            "b9371cdef38ec0f4ba4ef742879466b1604ca75a369b52e0bc8f6cdbe2077d02"
+        );
+    }
+
+    #[test]
     fn domain_and_payload_boundaries_matter() {
         assert_ne!(
             domain_hash(Domain::EthereumStateClaim, b"ab"),
-            domain_hash(Domain::ElementsEventClaim, b"ab")
+            domain_hash(Domain::Bip300RedemptionApprovalClaim, b"ab")
+        );
+        assert_ne!(
+            domain_hash(Domain::InboundMint, b"ab"),
+            domain_hash(Domain::Manifest, b"ab")
         );
         assert_ne!(
             domain_hash(Domain::EthereumStateClaim, b"ab"),

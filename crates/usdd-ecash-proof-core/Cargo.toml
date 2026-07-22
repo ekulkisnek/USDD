@@ -1,0 +1,17 @@
+[package]
+name = "usdd-ecash-proof-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Canonical recursive eCash/BIP300 proof state, segment execution, and fold journals"
+
+[features]
+default = ["std"]
+std = ["usdd-bitcoin-bmm/std", "usdd-core/std"]
+
+[dependencies]
+sha2.workspace = true
+usdd-bitcoin-bmm = { path = "../usdd-bitcoin-bmm", default-features = false }
+usdd-core = { path = "../usdd-core", default-features = false }

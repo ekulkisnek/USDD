@@ -5,13 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Fail-closed Bitcoin header and slot-24 BIP301 primitives for the USDD outbound proof"
+description = "Bitcoin header and slot-24 primitives for USDD BIP300 redemption approval proofs"
 
 [features]
 default = ["std"]
 std = []
+# Test-only adapter used by the separately built pinned-enforcer differential
+# harness. It exposes no checkpoint injection and is excluded from production
+# builds unless explicitly requested.
+enforcer-differential = ["std"]
 
 [dependencies]
 bitcoin_hashes = { version = "=0.14.101", default-features = false }
 k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa"] }
 sha2 = { workspace = true }
+usdd-core.workspace = true

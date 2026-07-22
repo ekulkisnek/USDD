@@ -32,9 +32,19 @@ If that file exists, merge the displayed example manually. Keep Windows on AC
 power, disable sleep and scheduled restarts, and retain at least 80 GB free on
 the drive containing WSL.
 
+Start Ubuntu and clone the proof branch again inside WSL's native Linux
+filesystem. Do not build or prove from `/mnt/c`, because Windows-mounted
+filesystem I/O can materially slow SP1 compilation and proving:
+
+```bash
+cd "$HOME"
+git clone --branch agent/windows-sp1-proof-runner https://github.com/ekulkisnek/USDD.git
+cd USDD
+```
+
 ## 2. Bootstrap the pinned toolchain
 
-Start Ubuntu/WSL2. From the repository root run:
+From the `~/USDD` repository root run:
 
 ```bash
 bash handoff/windows-wsl32/bootstrap.sh

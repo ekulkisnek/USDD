@@ -61,8 +61,14 @@ def main() -> int:
     capture = args.capture.resolve()
     capture_manifest_path = require_file(capture / "manifest.json", "capture manifest")
     capture_checksums = require_file(capture / "SHA256SUMS", "capture checksums")
-    if args.output.exists():
-        raise ValueError(f"output already exists: {args.output}")
+    final_output = args.output.resolve()
+    building_output = final_output.with_name(f".{final_output.name}.building")
+    if final_output.exists():
+        raise ValueError(f"output already exists: {final_output}")
+    if building_output.exists():
+        raise ValueError(
+            f"incomplete prior build exists: {building_output}; inspect or move it before retrying"
+        )
 
     run(["shasum", "-a", "256", "-c", capture_checksums.name], cwd=capture)
     captured = json.loads(capture_manifest_path.read_text())
@@ -83,7 +89,7 @@ def main() -> int:
     first_raw_path = require_file(first_spec_path.parent / first_raw_relative, "height-1 block")
     genesis_path = require_file(capture / genesis_relative, "genesis block")
 
-    output = args.output.resolve()
+    output = building_output
     output.mkdir(parents=True)
     artifact_dir = output / "artifacts"
     prepared_dir = output / "prepared-segments"
@@ -195,10 +201,11 @@ def main() -> int:
             continue
         checksum_lines.append(f"{sha256(path)}  {path.relative_to(output)}")
     (output / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
+    output.rename(final_output)
     print(
         json.dumps(
             {
-                "output": str(output),
+                "output": str(final_output),
                 "segments": len(prepared),
                 "firstHeight": prepared[0]["firstHeight"],
                 "lastHeight": prepared[-1]["lastHeight"],

@@ -171,8 +171,16 @@ pins the installed Groth16 verifier-key hash. The worker then:
 4. records atomic progress plus every per-stage log.
 
 It never manufactures a missing block or state. Any nonadjacent child causes
-the frozen fold program or host preflight to fail. After `SUCCESS`, package the
-complete result:
+the frozen fold program or host preflight to fail. It also independently checks
+every segment's schema, transparent-proof mode, non-TEE status, guest identity,
+public values, and artifact hashes before folding. The final Groth16 wrapper
+must identify the folded proof, match its public values, and pass SP1 SDK
+verification before the run can report `SUCCESS`.
+
+The Mac builder publishes its input directory atomically only after every
+segment executes natively and all state, tip, and height adjacency checks pass.
+A failed preparation remains visibly named `.NAME.building` and must never be
+used as a handoff. After `SUCCESS`, package the complete result:
 
 ```bash
 bash handoff/windows-wsl32/package-transition-result.sh

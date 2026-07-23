@@ -39,7 +39,7 @@
     "usddBaseCommit": "507c569dc3ea21f4dc30335902fcadb4f12f4b52",
     "enforcerRepository": "https://github.com/LayerTwo-Labs/bip300301_enforcer.git",
     "enforcerCommit": "52dc3d4b9ad82bea30887318186cc3c6ec3c08cf",
-    "signetMinerRepository": "https://github.com/bitcoin/bitcoin.git",
+    "signetMinerRepository": "https://github.com/LayerTwo-Labs/bitcoin-patched.git",
     "signetMinerCommit": "db46e768a88a5c5cf5ec1b1a6bc56023cc201884"
   }
 }

@@ -83,6 +83,20 @@ struct GenesisSegmentSpec {
     reward_recipient: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SuccessorSegmentSpec {
+    reward_recipient: String,
+    blocks: Vec<SuccessorBlockSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SuccessorBlockSpec {
+    raw_block: String,
+    canonical_m6_artifact: Option<String>,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     if SP1_CIRCUIT_VERSION != "v6.1.0" {
@@ -111,6 +125,16 @@ async fn main() -> Result<()> {
             let output = required_path(&mut args, "new output directory")?;
             reject_trailing(&mut args)?;
             prepare_genesis_segment(&segment, &fold, &spec, &genesis, &block, &output).await
+        }
+        Some("prepare-segment") => {
+            let segment = required_path(&mut args, "segment ELF")?;
+            let fold = required_path(&mut args, "fold ELF")?;
+            let config = required_path(&mut args, "canonical config")?;
+            let prior_state = required_path(&mut args, "canonical prior state")?;
+            let spec = required_path(&mut args, "successor-segment JSON spec")?;
+            let output = required_path(&mut args, "new output directory")?;
+            reject_trailing(&mut args)?;
+            prepare_successor_segment(&segment, &fold, &config, &prior_state, &spec, &output).await
         }
         Some("prove-segment") => {
             let segment = required_path(&mut args, "segment ELF")?;
@@ -144,7 +168,7 @@ async fn main() -> Result<()> {
 
 fn usage(executable: &Path) -> String {
     format!(
-        "usage:\n  {0} setup <segment.elf> <fold.elf>\n  {0} prepare-genesis-segment <segment.elf> <fold.elf> <spec.json> <genesis.raw> <successor.raw> <new-output-dir>\n  {0} prove-segment <segment.elf> <fold.elf> <segment-input.bin> <new-output-dir>\n  {0} fold <segment.elf> <fold.elf> <config.bin> <left-proof-dir> <right-proof-dir> <new-output-dir>\n  {0} wrap-groth16 <segment.elf> <fold.elf> <compressed-proof-dir> <new-output-dir>",
+        "usage:\n  {0} setup <segment.elf> <fold.elf>\n  {0} prepare-genesis-segment <segment.elf> <fold.elf> <spec.json> <genesis.raw> <successor.raw> <new-output-dir>\n  {0} prepare-segment <segment.elf> <fold.elf> <config.bin> <prior-state.bin> <spec.json> <new-output-dir>\n  {0} prove-segment <segment.elf> <fold.elf> <segment-input.bin> <new-output-dir>\n  {0} fold <segment.elf> <fold.elf> <config.bin> <left-proof-dir> <right-proof-dir> <new-output-dir>\n  {0} wrap-groth16 <segment.elf> <fold.elf> <compressed-proof-dir> <new-output-dir>",
         executable.display()
     )
 }
@@ -214,11 +238,12 @@ async fn prepare_genesis_segment(
         maximum_parent_block_time,
         reward_recipient: decode_fixed_hex::<20>(&spec.reward_recipient, "rewardRecipient")?,
     };
-    let (_, expected) =
+    let (next_state, expected) =
         execute_segment(&input).context("native genesis segment execution rejected")?;
     fs::create_dir(output).with_context(|| format!("failed to create {}", output.display()))?;
     fs::write(output.join("config.bin"), config.encode())?;
     fs::write(output.join("prior-state.bin"), prior_state.encode())?;
+    fs::write(output.join("next-state.bin"), next_state.encode())?;
     fs::write(output.join("segment-input.bin"), input.encode())?;
     fs::write(
         output.join("expected-public-values.bin"),
@@ -240,6 +265,124 @@ async fn prepare_genesis_segment(
         }))?,
     )?;
     Ok(())
+}
+
+async fn prepare_successor_segment(
+    segment_path: &Path,
+    fold_path: &Path,
+    config_path: &Path,
+    prior_state_path: &Path,
+    spec_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    require_new_output(output)?;
+    let config_bytes = fs::read(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = EcashProofConfig::decode_exact(&config_bytes).context("invalid proof config")?;
+    if config.encode() != config_bytes {
+        bail!("proof config is noncanonical");
+    }
+    let prior_state_bytes = fs::read(prior_state_path)
+        .with_context(|| format!("failed to read {}", prior_state_path.display()))?;
+    let prior_state = usdd_ecash_proof_core::EcashProofState::decode_exact(&prior_state_bytes)
+        .context("invalid prior proof state")?;
+    if prior_state.encode() != prior_state_bytes {
+        bail!("prior proof state is noncanonical");
+    }
+    prior_state
+        .validate(&config)
+        .context("prior proof state does not match config")?;
+
+    let spec_bytes =
+        fs::read(spec_path).with_context(|| format!("failed to read {}", spec_path.display()))?;
+    let spec: SuccessorSegmentSpec =
+        serde_json::from_slice(&spec_bytes).context("invalid successor-segment JSON spec")?;
+    if spec.blocks.is_empty() {
+        bail!("successor segment must contain at least one block");
+    }
+    let spec_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut blocks = Vec::with_capacity(spec.blocks.len());
+    let mut maximum_parent_block_time = 0u64;
+    for (index, block_spec) in spec.blocks.iter().enumerate() {
+        let raw_path = resolve_spec_path(spec_dir, &block_spec.raw_block);
+        let raw_block = read_raw_or_hex_block(&raw_path)
+            .with_context(|| format!("invalid raw block at spec index {index}"))?;
+        if raw_block.len() < 80 {
+            bail!("raw block at spec index {index} is shorter than its header");
+        }
+        maximum_parent_block_time = maximum_parent_block_time.max(u64::from(u32::from_le_bytes(
+            raw_block[68..72]
+                .try_into()
+                .expect("parent header length checked"),
+        )));
+        let canonical_m6_artifact = block_spec
+            .canonical_m6_artifact
+            .as_deref()
+            .map(|path| {
+                let path = resolve_spec_path(spec_dir, path);
+                fs::read(&path)
+                    .with_context(|| format!("failed to read M6 artifact {}", path.display()))
+            })
+            .transpose()?;
+        blocks.push(BlockWitness {
+            raw_block,
+            canonical_m6_artifact,
+        });
+    }
+
+    let options = low_memory_options();
+    let segment = derive_identity(segment_path, &options).await?;
+    let fold = derive_identity(fold_path, &options).await?;
+    require_config_identities(&config, &segment, &fold)?;
+    let expected_prior_state_commitment = prior_state.commitment(&config)?;
+    let input = SegmentInput {
+        config: config.clone(),
+        prior_state: prior_state.clone(),
+        expected_prior_state_commitment,
+        blocks,
+        maximum_parent_block_time,
+        reward_recipient: decode_fixed_hex::<20>(&spec.reward_recipient, "rewardRecipient")?,
+    };
+    let (next_state, expected) =
+        execute_segment(&input).context("native successor segment execution rejected")?;
+
+    fs::create_dir(output).with_context(|| format!("failed to create {}", output.display()))?;
+    fs::write(output.join("config.bin"), config.encode())?;
+    fs::write(output.join("prior-state.bin"), prior_state.encode())?;
+    fs::write(output.join("next-state.bin"), next_state.encode())?;
+    fs::write(output.join("segment-input.bin"), input.encode())?;
+    fs::write(
+        output.join("expected-public-values.bin"),
+        expected.journal(false),
+    )?;
+    fs::write(
+        output.join("metadata.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "usdd-ecash-successor-segment-input-v1",
+            "configHash": hex::encode(config.config_hash()?.0),
+            "priorStateCommitment": hex::encode(expected.prior_state_commitment.0),
+            "nextStateCommitment": hex::encode(expected.next_state_commitment.0),
+            "priorTip": hex::encode(expected.prior_tip_hash.0),
+            "nextTip": hex::encode(expected.next_tip_hash.0),
+            "priorHeight": expected.prior_height,
+            "nextHeight": expected.next_height,
+            "blockCount": expected.block_count,
+            "maximumParentBlockTime": maximum_parent_block_time,
+            "segmentProgramId": hex::encode(segment.raw_vkey_hash),
+            "foldProgramId": hex::encode(fold.raw_vkey_hash),
+            "publicValues": artifact_json(&expected.journal(false)),
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn resolve_spec_path(spec_dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        spec_dir.join(path)
+    }
 }
 
 async fn setup(segment_path: &Path, fold_path: &Path) -> Result<()> {

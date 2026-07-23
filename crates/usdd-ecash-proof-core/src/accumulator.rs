@@ -95,11 +95,11 @@ impl ApprovalAccumulator {
     fn recompute_root(&self) -> Hash32 {
         let empty = empty_hashes();
         let mut node = empty[0];
-        for level in 0..APPROVAL_TREE_DEPTH {
+        for (level, empty_at_level) in empty.iter().enumerate().take(APPROVAL_TREE_DEPTH) {
             node = if ((self.count >> level) & 1) == 1 {
                 approval_node(self.frontier[level], node)
             } else {
-                approval_node(node, empty[level])
+                approval_node(node, *empty_at_level)
             };
         }
         node

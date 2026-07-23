@@ -26,6 +26,7 @@ Commands:
 ```text
 usdd-ecash-prover setup <segment.elf> <fold.elf>
 usdd-ecash-prover prepare-genesis-segment <segment.elf> <fold.elf> <spec.json> <genesis.raw> <successor.raw> <new-output-dir>
+usdd-ecash-prover prepare-segment <segment.elf> <fold.elf> <config.bin> <prior-state.bin> <spec.json> <new-output-dir>
 usdd-ecash-prover prove-segment <segment.elf> <fold.elf> <segment-input.bin> <new-output-dir>
 usdd-ecash-prover fold <segment.elf> <fold.elf> <config.bin> <left-proof-dir> <right-proof-dir> <new-output-dir>
 usdd-ecash-prover wrap-groth16 <segment.elf> <fold.elf> <compressed-proof-dir> <new-output-dir>
@@ -56,6 +57,21 @@ fields are `ethereumChainId`, `relayAddress`, `elementsGenesis`, `usddAsset`,
 `vaultId`, `verifierConfigHash`, `finalityDepth`, `maxSegmentBlocks`,
 `maxTransitionBlocks`, `maxSegmentBytes`, `maxStateBytes`, and
 `rewardRecipient`.
+
+`prepare-segment` accepts the canonical config and exact predecessor state from
+the previous preparation. Its strict JSON spec contains `rewardRecipient` and
+`blocks`; each block has a `rawBlock` path and an optional
+`canonicalM6Artifact` path, resolved relative to the spec. It executes the
+complete segment natively and writes the next state, canonical input, expected
+journal, and adjacency metadata before any proving is attempted.
+
+`scripts/capture_ecash_segments.py` performs a read-only parent JSON-RPC
+capture, independently checks block hashes and consecutive parent links, and
+emits checksummed segment specifications. After capture,
+`scripts/build_ecash_windows_handoff.py` drives both preparation commands,
+requires every native successor state to be exactly adjacent, and emits one
+checksummed Windows proving handoff. Generated blocks, states, and proofs stay
+outside Git.
 
 Ethereum consumes the output through `SP1Groth16ProofComponentV1`, which pins
 the direct SP1 v6.1.0 Groth16 verifier runtime, verifier identity, guest program

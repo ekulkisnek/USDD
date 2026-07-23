@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
 
 use usdd_core::{burn_accumulator_empty, Hash32, OutPoint};
@@ -125,7 +125,7 @@ pub enum BundleOperationalAction {
         m6id: Hash32,
         score: u16,
         chronological_m4_index: u32,
-        actual: ActualM6Artifact,
+        actual: Box<ActualM6Artifact>,
     },
 }
 
@@ -292,7 +292,7 @@ pub fn evaluate_bundle_operation(
         m6id,
         score: target.score,
         chronological_m4_index,
-        actual: ActualM6Artifact::build(bundle, ctip)?,
+        actual: Box::new(ActualM6Artifact::build(bundle, ctip)?),
     })
 }
 

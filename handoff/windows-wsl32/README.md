@@ -148,8 +148,75 @@ Return the wrapper `.tar.gz` and `.sha256` files. The package must include:
 - the 551-byte segment public values;
 - the 907-byte `relay-proof.bin` concatenation;
 - `ethereum-verifier-arguments.json`;
+
+## 6. Prove a complete adjacent transition handoff
+
+For a Mac-produced `usdd-ecash-windows-proof-handoff-v2` directory, use the
+transition runner instead of the single-fixture commands:
+
+```bash
+bash handoff/windows-wsl32/start-transition-handoff.sh \
+  /absolute/path/to/extracted-handoff
+
+bash handoff/windows-wsl32/transition-status.sh
+```
+
+The launcher verifies every handoff checksum, requires at least 24 GiB visible
+RAM and 120 GiB free disk, preserves the same low-memory worker profile, and
+pins the installed Groth16 verifier-key hash. The worker then:
+
+1. proves every prepared segment in height order;
+2. recursively folds each exactly adjacent proof into one transition;
+3. Groth16-wraps and SDK-verifies the final fold; and
+4. records atomic progress plus every per-stage log.
+
+It never manufactures a missing block or state. Any nonadjacent child causes
+the frozen fold program or host preflight to fail. After `SUCCESS`, package the
+complete result:
+
+```bash
+bash handoff/windows-wsl32/package-transition-result.sh
+```
+
+Return only the resulting archive and checksum. Generated proofs remain
+uncommitted.
 - the SP1 proof container and fixed program identities.
 
 This segment wrapper proves the Ethereum verification pipeline, but it is not
 the production relay authorization. Production still requires source segments
 covering a real finalized slot-24 M6 and one adjacent `ECASH_FOLD_V1` proof.
+
+## 7. Reproduce a V7 Ethereum inbound proof
+
+The Mac handoff builder accepts only the authentic Sepolia fixture schema,
+native-preflight status, frozen V7 program ID, exact five-record input length,
+and expected-journal hash:
+
+```bash
+python3 scripts/build_ethereum_windows_handoff.py \
+  --fixture /absolute/path/to/v7-live-finalized-fixture \
+  --elf artifacts/sp1/ethereum-state-v1.elf \
+  --output /new/ethereum-v7-handoff
+```
+
+After transferring that checksummed directory into WSL, run:
+
+```bash
+bash handoff/windows-wsl32/start-ethereum-handoff.sh \
+  /absolute/path/to/ethereum-v7-handoff
+
+bash handoff/windows-wsl32/ethereum-status.sh
+```
+
+The worker produces one compressed-transparent proof, requires its public
+values to equal the frozen expected journal byte-for-byte, and independently
+verifies the complete annex under the fixed V7 program ID before writing
+`SUCCESS`. This is a second-operator reproducibility job only: the primary Mac
+artifact already passed those checks. It does not replace the separate eCash
+segment/fold handoff.
+
+After success, package the independently verified result:
+
+```bash
+bash handoff/windows-wsl32/package-ethereum-result.sh
+```

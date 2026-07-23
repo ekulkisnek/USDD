@@ -97,6 +97,47 @@ class CaptureSegmentsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             capture.canonical_hex("ab" * 19, 20, "value")
 
+    def test_embeds_canonical_m6_artifact_hex(self) -> None:
+        fake = FakeRpc()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact_hex = "555344444d3658320001"
+            artifact_map = root / "m6.json"
+            artifact_map.write_text(
+                json.dumps(
+                    {
+                        "schema": "usdd-ecash-m6-artifact-map-v1",
+                        "artifacts": [
+                            {"height": 1, "artifactHex": artifact_hex}
+                        ],
+                    }
+                )
+            )
+            output = root / "capture"
+            argv = [
+                "capture_ecash_segments.py",
+                "--start-height",
+                "0",
+                "--end-height",
+                "1",
+                "--chunk-size",
+                "64",
+                "--reward-recipient",
+                "22" * 20,
+                "--m6-artifacts",
+                str(artifact_map),
+                "--output",
+                str(output),
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                capture, "Rpc", return_value=fake
+            ):
+                self.assertEqual(capture.main(), 0)
+            self.assertEqual(
+                (output / "m6-artifacts" / "00000001.bin").read_bytes(),
+                bytes.fromhex(artifact_hex),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

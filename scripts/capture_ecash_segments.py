@@ -91,25 +91,42 @@ def canonical_hex(value: str, size: int, label: str) -> str:
     return value
 
 
-def load_m6_artifacts(path: str | None) -> dict[int, Path]:
+def load_m6_artifacts(path: str | None) -> dict[int, bytes]:
     if path is None:
         return {}
     manifest_path = Path(path).resolve()
     payload = json.loads(manifest_path.read_text())
     if payload.get("schema") != "usdd-ecash-m6-artifact-map-v1":
         raise ValueError("unsupported M6 artifact map schema")
-    result: dict[int, Path] = {}
+    result: dict[int, bytes] = {}
     for item in payload.get("artifacts", []):
         height = int(item["height"])
-        artifact = Path(item["path"])
-        if not artifact.is_absolute():
-            artifact = manifest_path.parent / artifact
-        artifact = artifact.resolve()
-        if not artifact.is_file():
-            raise ValueError(f"missing M6 artifact for height {height}: {artifact}")
+        has_path = "path" in item
+        has_hex = "artifactHex" in item
+        if has_path == has_hex:
+            raise ValueError(
+                f"M6 artifact at height {height} must provide exactly one of path or artifactHex"
+            )
+        if has_path:
+            artifact = Path(item["path"])
+            if not artifact.is_absolute():
+                artifact = manifest_path.parent / artifact
+            artifact = artifact.resolve()
+            if not artifact.is_file():
+                raise ValueError(f"missing M6 artifact for height {height}: {artifact}")
+            artifact_bytes = artifact.read_bytes()
+        else:
+            try:
+                artifact_bytes = bytes.fromhex(item["artifactHex"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"invalid canonical M6 artifact hex at height {height}"
+                ) from error
+        if not artifact_bytes:
+            raise ValueError(f"empty M6 artifact at height {height}")
         if height in result:
             raise ValueError(f"duplicate M6 artifact height {height}")
-        result[height] = artifact
+        result[height] = artifact_bytes
     return result
 
 
@@ -175,9 +192,9 @@ def main() -> int:
         height = int(block["height"])
         (block_dir / f"{height:08d}-{block['hash']}.raw").write_bytes(block.pop("raw"))
     copied_artifacts: dict[int, str] = {}
-    for height, source in sorted(m6_artifacts.items()):
+    for height, artifact_bytes in sorted(m6_artifacts.items()):
         destination = artifact_dir / f"{height:08d}.bin"
-        destination.write_bytes(source.read_bytes())
+        destination.write_bytes(artifact_bytes)
         copied_artifacts[height] = f"../m6-artifacts/{destination.name}"
 
     specs: list[dict[str, object]] = []

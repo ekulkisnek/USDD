@@ -1,0 +1,14 @@
+{
+  "ethereumChainId": 11155111,
+  "relayAddress": "aba1c939f274d8867f9e2a133adbfe5ccdf29420",
+  "elementsGenesis": "3336884b616fb495e5faedc77be45bf2951b9d7d0887aaafd2f54873a8ddb1d6",
+  "usddAsset": "f3438f678e3518faad1c850806105752c3b533bf6a9198ac914b880dfe2f3891",
+  "vaultId": "14763a538e170c96288a1aa50890393622b6c93ab64fb72f9839e5cc9f79e628",
+  "verifierConfigHash": "c6b07fb7c5e96a2cb4f67497b66fd2af977f03e31e9a88e909007564137d29d4",
+  "finalityDepth": 100,
+  "maxSegmentBlocks": 256,
+  "maxTransitionBlocks": 30000,
+  "maxSegmentBytes": 33554432,
+  "maxStateBytes": 67108864,
+  "rewardRecipient": "2222222222222222222222222222222222222222"
+}

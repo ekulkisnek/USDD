@@ -42,6 +42,23 @@ def run(command: list[str], *, cwd: Path | None = None) -> None:
     subprocess.run(command, check=True, cwd=cwd)
 
 
+def verify_sha256sums(root: Path, sums_path: Path) -> None:
+    for line_number, line in enumerate(sums_path.read_text().splitlines(), start=1):
+        if not line:
+            continue
+        try:
+            expected, relative = line.split("  ", 1)
+        except ValueError as error:
+            raise ValueError(
+                f"malformed checksum line {line_number}: {sums_path}"
+            ) from error
+        candidate = (root / relative).resolve()
+        if not candidate.is_relative_to(root.resolve()):
+            raise ValueError(f"checksum path escapes capture: {relative}")
+        if not candidate.is_file() or sha256(candidate) != expected:
+            raise ValueError(f"checksum mismatch: {relative}")
+
+
 def metadata(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text())
     if value.get("schema") not in {
@@ -70,7 +87,7 @@ def main() -> int:
             f"incomplete prior build exists: {building_output}; inspect or move it before retrying"
         )
 
-    run(["shasum", "-a", "256", "-c", capture_checksums.name], cwd=capture)
+    verify_sha256sums(capture, capture_checksums)
     captured = json.loads(capture_manifest_path.read_text())
     if captured.get("schema") != "usdd-ecash-captured-segments-v1":
         raise ValueError("unsupported captured-segment schema")

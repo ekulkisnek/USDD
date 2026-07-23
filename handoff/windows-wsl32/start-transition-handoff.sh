@@ -17,6 +17,19 @@ test -x "$binary" || { echo "Run bootstrap.sh first." >&2; exit 2; }
 test -f "$handoff/handoff-manifest.json" || { echo "Missing handoff manifest." >&2; exit 2; }
 test -f "$handoff/SHA256SUMS" || { echo "Missing handoff checksums." >&2; exit 2; }
 (cd "$handoff" && sha256sum --check SHA256SUMS)
+git -C "$repo" diff --quiet
+git -C "$repo" diff --cached --quiet
+expected_commit=$(python3 - "$handoff/handoff-manifest.json" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["repositoryCommit"])
+PY
+)
+actual_commit=$(git -C "$repo" rev-parse HEAD)
+[[ $actual_commit == "$expected_commit" ]] || {
+    echo "Handoff requires repository commit $expected_commit; found $actual_commit." >&2
+    exit 2
+}
 python3 "$repo/scripts/usdd-sp1-prover/toolchain/prepare.py" --check-vendor
 
 memory_kib=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)

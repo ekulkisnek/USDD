@@ -131,6 +131,50 @@ def main() -> int:
     handoff = args.handoff.resolve()
     run_dir = args.run_dir.resolve()
     manifest = json.loads((handoff / "handoff-manifest.json").read_text())
+    repository = Path(__file__).resolve().parent.parent.parent
+    repository_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if manifest.get("repositoryCommit") != repository_commit:
+        raise ValueError(
+            "handoff source commit does not match the checked-out Windows runner"
+        )
+    if manifest.get("schema") == "usdd-ecash-windows-raw-handoff-v1":
+        prepared = run_dir / "prepared-handoff"
+        write_progress(
+            run_dir / "progress.json",
+            status="RUNNING",
+            stage="native-prepare-and-adjacency-preflight",
+            stageIndex=1,
+            stageCount=1,
+            label="prepare-authentic-segments",
+        )
+        execute(
+            [
+                sys.executable,
+                str(repository / "scripts/build_ecash_windows_handoff.py"),
+                "--prover",
+                str(binary),
+                "--segment-elf",
+                str(handoff / "artifacts/ecash-segment-v1.elf"),
+                "--fold-elf",
+                str(handoff / "artifacts/ecash-fold-v1.elf"),
+                "--genesis-spec",
+                str(handoff / "artifacts/genesis-segment-spec.json"),
+                "--capture",
+                str(handoff / str(manifest["capture"])),
+                "--output",
+                str(prepared),
+            ],
+            run_dir / "native-prepare-and-adjacency-preflight.log",
+        )
+        handoff = prepared
+        manifest = json.loads((handoff / "handoff-manifest.json").read_text())
+        if manifest.get("repositoryCommit") != repository_commit:
+            raise ValueError("prepared handoff source commit changed during preflight")
     if manifest.get("schema") != "usdd-ecash-windows-proof-handoff-v2":
         raise ValueError("unsupported handoff schema")
     segments = manifest.get("segments")

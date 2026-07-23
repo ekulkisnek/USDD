@@ -149,10 +149,14 @@ Return the wrapper `.tar.gz` and `.sha256` files. The package must include:
 - the 907-byte `relay-proof.bin` concatenation;
 - `ethereum-verifier-arguments.json`;
 
-## 6. Prove a complete adjacent transition handoff
+## 6. Prepare and prove the complete M6 transition on Windows
 
-For a Mac-produced `usdd-ecash-windows-proof-handoff-v2` directory, use the
-transition runner instead of the single-fixture commands:
+The current package uses `usdd-ecash-windows-raw-handoff-v1`. It contains the
+authentic private-Signet blocks through the accepted M6, the exact capture
+manifest, genesis configuration, and both frozen guest ELFs. Windows performs
+the native preparation that was formerly done on the memory-constrained Mac.
+
+Use the transition runner instead of the single-fixture commands:
 
 ```bash
 bash handoff/windows-wsl32/start-transition-handoff.sh \
@@ -161,14 +165,18 @@ bash handoff/windows-wsl32/start-transition-handoff.sh \
 bash handoff/windows-wsl32/transition-status.sh
 ```
 
-The launcher verifies every handoff checksum, requires at least 24 GiB visible
-RAM and 120 GiB free disk, preserves the same low-memory worker profile, and
-pins the installed Groth16 verifier-key hash. The worker then:
+The launcher verifies every handoff checksum, requires the exact clean source
+commit named by the handoff, requires at least 24 GiB visible RAM and 120 GiB
+free disk, preserves the same low-memory worker profile, and pins the installed
+Groth16 verifier-key hash. The worker then:
 
-1. proves every prepared segment in height order;
-2. recursively folds each exactly adjacent proof into one transition;
-3. Groth16-wraps and SDK-verifies the final fold; and
-4. records atomic progress plus every per-stage log.
+1. prepares every authentic segment and executes it natively;
+2. checks exact state-commitment, block-tip, and height adjacency;
+3. publishes the prepared handoff atomically;
+4. proves every prepared segment in height order;
+5. recursively folds each exactly adjacent proof into one transition;
+6. Groth16-wraps and SDK-verifies the final fold; and
+7. records atomic progress plus every per-stage log.
 
 It never manufactures a missing block or state. Any nonadjacent child causes
 the frozen fold program or host preflight to fail. It also independently checks
@@ -177,10 +185,10 @@ public values, and artifact hashes before folding. The final Groth16 wrapper
 must identify the folded proof, match its public values, and pass SP1 SDK
 verification before the run can report `SUCCESS`.
 
-The Mac builder publishes its input directory atomically only after every
-segment executes natively and all state, tip, and height adjacency checks pass.
-A failed preparation remains visibly named `.NAME.building` and must never be
-used as a handoff. After `SUCCESS`, package the complete result:
+The Windows preparation publishes its internal prepared directory atomically
+only after every segment executes natively and all adjacency checks pass. A
+failed preparation remains visibly named `.prepared-handoff.building` and the
+worker stops before proving. After `SUCCESS`, package the complete result:
 
 ```bash
 bash handoff/windows-wsl32/package-transition-result.sh

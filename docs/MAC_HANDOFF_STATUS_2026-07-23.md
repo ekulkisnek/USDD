@@ -31,40 +31,39 @@ It is valid evidence for the captured test-chain transition, but it does not
 authorize a payout from a differently identified Sepolia deployment. It must
 not be represented as a live withdrawal from the current Sepolia vault.
 
-## Remaining Mac gate
+## Windows-first preparation decision
 
-The four captured inputs still need to be executed by the frozen native eCash
-SP1 host to produce the exact prepared inputs and expected journals. That
-preflight must verify state commitment, block tip, and height adjacency across
-all four segments before the handoff is published.
+The stopped Mac VM exposed only 6 GiB of RAM, and its previously built host
+predated successor-segment preparation. The preparation gate therefore moves
+to the 32 GiB Windows/WSL machine. This does not change any cryptographic
+assumption: all blocks, identities, ELFs, checksums, expected M6 evidence, and
+the exact source commit remain frozen before transfer.
 
-The existing Mac SP1 process is intentionally left untouched. Native
-preparation derives SP1 identities and can allocate proving-key data, so it
-must not run concurrently on this memory-constrained machine. Once the current
-process ends naturally, run the checked-in handoff builder with:
+The raw handoff contains:
 
 - `artifacts/testnet/ecash-private-signet-0-628-m6-v1`
 - `artifacts/testnet/private-signet-m6-genesis-spec.json`
 - the frozen `ecash-segment-v1.elf`
 - the frozen `ecash-fold-v1.elf`
-- the matching native eCash prover host
+- the exact source commit used to build the matching eCash prover host
 
-Only a final directory containing `handoff-manifest.json` and a verified
-`SHA256SUMS` is eligible for transfer.
+Windows must natively execute all four captured inputs and verify state
+commitment, block tip, and height adjacency before it may start proving.
 
 ## Next Windows work
 
-After the native Mac gate passes, Windows should receive the immutable handoff
-and run `handoff/windows-wsl32/start-transition-handoff.sh`. Windows will then
-produce:
+Windows should receive the immutable raw handoff and run
+`handoff/windows-wsl32/start-transition-handoff.sh`. Windows will then produce:
 
-1. one compressed-transparent proof for each of the four adjacent segments;
-2. the recursive fold covering heights 1 through 628;
-3. the folded-M6 Groth16 proof and Ethereum verifier arguments;
-4. proof metadata, public values, logs, and checksums.
+1. a native-preflighted prepared handoff with exact expected journals;
+2. one compressed-transparent proof for each of the four adjacent segments;
+3. the recursive fold covering heights 1 through 628;
+4. the folded-M6 Groth16 proof and Ethereum verifier arguments;
+5. proof metadata, public values, logs, and checksums.
 
 No generated proof belongs in Git. The reproducible runner and non-secret
-inputs may be pushed only after the native-preflight result is frozen.
+inputs may be pushed before proving because native preflight is now a mandatory,
+fail-closed first stage of the Windows worker.
 
 ## Release gates that remain after Windows
 

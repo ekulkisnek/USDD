@@ -188,7 +188,6 @@ bash handoff/windows-wsl32/package-transition-result.sh
 
 Return only the resulting archive and checksum. Generated proofs remain
 uncommitted.
-- the SP1 proof container and fixed program identities.
 
 This segment wrapper proves the Ethereum verification pipeline, but it is not
 the production relay authorization. Production still requires source segments

@@ -1,0 +1,45 @@
+{
+  "schema": "usdd-ecash-corrected-chain-recovery-v1",
+  "network": {
+    "name": "private-layer-two-signet",
+    "genesisDisplay": "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+    "signetChallenge": "0014751e76e8199196d454941c45d1b3a323f1433bd6",
+    "testOnlySignetWif": "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87JcbXMTcA",
+    "testOnlyEnforcerMnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+  },
+  "elements": {
+    "slot": 24,
+    "genesisDisplay": "3336884b616fb495e5faedc77be45bf2951b9d7d0887aaafd2f54873a8ddb1d6",
+    "proposalDescriptionHex": "0008456c656d656e7473426c6f636b73747265616d7320656c656d656e74732c20656e61626c696e672073696d706c6963697479207363726970745883560531f013b9b27b2f9cfbac4f64ee5062b95ad3e21593a8f6916530b74bb2b7b20f3fbc4baf50e9d39f58661c6168e279d4",
+    "proposalHashInternal": "b8aaccf53b31e14e31e2de2daaf5aded6b48056d302006f27dc5b3c34d8a9a16",
+    "proposalHashDisplay": "169a8a4dc3b3c57df20620306d05486bedadf5aa2ddee2314ee1313bf5ccaab8"
+  },
+  "rejectedHistory": {
+    "capture": "ecash-private-signet-0-628-m6-v1",
+    "firstProposalInternal": "b8aaccf53b31e14e31e2de2daaf5aded6b48056d302006f27dc5b3c34d8a9a16",
+    "firstProposalHeight": 2,
+    "firstActivationHeight": 8,
+    "replacementProposalInternal": "4960458d2502e27346fbd042634259734607be4e5d03ac47264506c3d0a2be8c",
+    "replacementProposalHeight": 103,
+    "replacementActivationHeight": 109,
+    "reason": "The current Elements proposal is replaced at height 109, so no single Elements identity remains continuous through the M6 at height 498."
+  },
+  "correctedHistoryRequirements": {
+    "startFromGenesis": true,
+    "requiredProposalMustBeFirstSlot24Proposal": true,
+    "requiredProposalMustRemainActiveThroughFinalM6": true,
+    "forbidProposalInternal": [
+      "4960458d2502e27346fbd042634259734607be4e5d03ac47264506c3d0a2be8c"
+    ],
+    "minimumM6Confirmations": 100,
+    "requireEnforcerAcceptance": true,
+    "requireNativeReplayBeforeProving": true
+  },
+  "sourcePins": {
+    "usddBaseCommit": "507c569dc3ea21f4dc30335902fcadb4f12f4b52",
+    "enforcerRepository": "https://github.com/LayerTwo-Labs/bip300301_enforcer.git",
+    "enforcerCommit": "52dc3d4b9ad82bea30887318186cc3c6ec3c08cf",
+    "signetMinerRepository": "https://github.com/bitcoin/bitcoin.git",
+    "signetMinerCommit": "db46e768a88a5c5cf5ec1b1a6bc56023cc201884"
+  }
+}

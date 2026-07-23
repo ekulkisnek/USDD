@@ -63,14 +63,14 @@ pub const SLOT24_M6_REQUIRED_SCORE: u16 = SLOT24_M6_INCLUSION_THRESHOLD + 1;
 pub const MAX_PENDING_SLOT24_M6IDS: usize =
     BITCOIN_MAX_COINBASE_OUTPUTS * (SLOT24_M6_MAX_AGE as usize + 2);
 
-/// Frozen internal/wire byte order of the installed Elements V4 proposal hash.
+/// Frozen internal/wire byte order of the sole installed Elements V7 proposal.
 ///
 /// Reversing these bytes produces the display hash
-/// `8cbea2d0c306452647ac035d4ebe07467359426342d0fb4673e202258d456049`
+/// `169a8a4dc3b3c57df20620306d05486bedadf5aa2ddee2314ee1313bf5ccaab8`
 /// from `elements_drivechain_identity.h`.
 pub const ELEMENTS_V1_REQUIRED_PROPOSAL_HASH_INTERNAL: [u8; 32] = [
-    0x49, 0x60, 0x45, 0x8d, 0x25, 0x02, 0xe2, 0x73, 0x46, 0xfb, 0xd0, 0x42, 0x63, 0x42, 0x59, 0x73,
-    0x46, 0x07, 0xbe, 0x4e, 0x5d, 0x03, 0xac, 0x47, 0x26, 0x45, 0x06, 0xc3, 0xd0, 0xa2, 0xbe, 0x8c,
+    0xb8, 0xaa, 0xcc, 0xf5, 0x3b, 0x31, 0xe1, 0x4e, 0x31, 0xe2, 0xde, 0x2d, 0xaa, 0xf5, 0xad, 0xed,
+    0x6b, 0x48, 0x05, 0x6d, 0x30, 0x20, 0x06, 0xf2, 0x7d, 0xc5, 0xb3, 0xc3, 0x4d, 0x8a, 0x9a, 0x16,
 ];
 
 /// Maximum creation-height window for a still-live Elements V1 proposal.
@@ -2053,12 +2053,10 @@ mod tests {
     #[test]
     fn frozen_proposal_hash_matches_elements_identity() {
         let description_hex = concat!(
-            "0008456c656d656e7473456c656d656e7473204472697665636861696e207631",
-            "3b206e617469766520555344443b207265706c61792076343b206f6e65204d36",
-            "2070657220706172656e7420626c6f636b3b207769746864726177616c206163",
-            "63756d756c61746f722076313b2053696d706c6963697479206163746976653b",
-            "20736c6f74203234f29aa8f8f41516ea0aa9845173f3d0d30144d4493495e749",
-            "891310d419f4cf59d0552b4c7cacc18ce49532f6cb09fc877f56bafe"
+            "0008456c656d656e7473426c6f636b73747265616d7320656c656d656e74732c",
+            "20656e61626c696e672073696d706c6963697479207363726970745883560531",
+            "f013b9b27b2f9cfbac4f64ee5062b95ad3e21593a8f6916530b74bb2b7b20f3",
+            "fbc4baf50e9d39f58661c6168e279d4"
         );
         let description = description_hex
             .as_bytes()

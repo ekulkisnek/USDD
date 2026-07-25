@@ -14,7 +14,24 @@ The source proved was commit:
 
 `541afa80ede9f20632b7803602e33a1b10e87cee`
 
-No proof binaries or archives are committed. They remain local.
+The validated proof bytes are committed as:
+
+`artifacts/testnet/ecash-m6-transition-20260725/proof-artifacts.tar.gz`
+
+Bundle SHA256:
+
+`aa0cf2a54e36beabf66659911aa45d219e4f12e4fe25da59c3cb01cfd6f4ad54`
+
+The bundle contains all three segment proof directories, both fold proof
+directories, and the complete Groth16 wrapper directory. Operational recovery
+logs and incident archives remain local.
+
+Verify and inspect it with:
+
+```bash
+sha256sum artifacts/testnet/ecash-m6-transition-20260725/proof-artifacts.tar.gz
+tar -tzf artifacts/testnet/ecash-m6-transition-20260725/proof-artifacts.tar.gz
+```
 
 ## Where to find the validated files
 

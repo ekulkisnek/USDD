@@ -1,0 +1,64 @@
+{
+  "schema": "usdd-ecash-final-transition-result-v1",
+  "completedUtc": "2026-07-25T08:15:06Z",
+  "sourceCommit": "541afa80ede9f20632b7803602e33a1b10e87cee",
+  "programs": {
+    "segmentElfSha256": "94e9c1c90b5ba8692717bbb283db2faa4d1d5ce4417dd416a951940528542866",
+    "foldElfSha256": "e6ab15804eb165f28fab9b84a5d32acce398e033f61f1e0c87e5dbbdde50bc9e",
+    "configSha256": "d056ec058fad55171d4fb4446e860d4ed4233ef94d2627c1953121af56ebc461",
+    "programVKeyBn254": "0x008acfe4b581fbc808dc54693c2416e6b1b5c3cd361869557235282da6a2fca2"
+  },
+  "artifacts": {
+    "segment1RawProofSha256": "d84a7678eb18b91fa8078f9b9a370624e6f245463dde602802e345e7ad23fc10",
+    "segment2RawProofSha256": "df1a5c90bbc6c6d50207e94fd2525345c327f6906ecf206d07635e88182945df",
+    "segment3RawProofSha256": "73d09188e263c18bf742017b076656507add66cf6922d02a38a650f7cee2ce32",
+    "fold1RawProofSha256": "140e34e4e98911197931dc42596612d56fa4209046cd859180d822fd927f35c4",
+    "fold2RawProofSha256": "29ebefd2eaa1f92bff376bdaae92c05ea11b7985075df95673174825eaaf7ca4",
+    "finalPublicValuesSha256": "740c1ac249605455adf424a4c05994d187edcbe337dc304d0bbf8cbcbdd16995",
+    "groth16ProofSha256": "e510708ab7d8d0b80b6a9f6fd36abdea1b735343b6d02f054d8029b228758dd1",
+    "relayProofSha256": "5ab62677d4196131e3b9a2fe432fcd8ab38894a9d6637b3da8636efe08e23b8b"
+  },
+  "transition": {
+    "firstSegmentNextHeight": 1,
+    "finalNextHeight": 263,
+    "firstSegmentNextTip": "000002618ab30f7e2226f07ca1da989b50edc4cb01764c169d50bc8e1a90b181",
+    "finalNextTip": "000000df3094868e602a1f068a62ccca64376b1b2bbaa67aab83d760adf1ea11",
+    "genesisPriorStateCommitment": "247b6d04d000b160a38e3b5e16bc2c6584772940577180e78622e719c9da87cd",
+    "finalNextStateCommitment": "fabdc76b233ed400f8b233850c2dee74d0f3e9f4e5fca8ec0bf1dd0a67001e0d",
+    "adjacencyValidated": true
+  },
+  "verification": {
+    "sdkVerifiedBeforeWrap": true,
+    "sdkVerifiedAfterWrap": true,
+    "status": "GROTH16_WRAPPER_SDK_VERIFIED",
+    "ethereumInterface": "ISP1Verifier.verifyProof(bytes32 programVKey,bytes publicValues,bytes proofBytes)"
+  },
+  "localArchives": {
+    "correctedCaptureSha256": "b0867b3e09a5ab5fbf2613fdf42aa1ff30c3b677150518ee253929a1035967c4",
+    "recoverySuccessSha256": "7635bc67bba937f45437cea0e8ca0546752ac40d928be628c2dcc236a9910637",
+    "originalOomIncidentSha256": "cb248b8d6d1e1943ad1e19c2165550614a052dcf11ef5ae827606430423616e3",
+    "validationReportSha256": "20ecc9637b518c1197bf3b4eeafc2300006ec74b4b608594817afad1c3943faf"
+  },
+  "committedProofBundle": {
+    "path": "artifacts/testnet/ecash-m6-transition-20260725/proof-artifacts.tar.gz",
+    "bytes": 8076013,
+    "sha256": "aa0cf2a54e36beabf66659911aa45d219e4f12e4fe25da59c3cb01cfd6f4ad54",
+    "contents": [
+      "segment-proofs",
+      "fold-proofs",
+      "groth16-wrapper"
+    ]
+  },
+  "committedCorrectedCapture": {
+    "path": "artifacts/testnet/ecash-m6-transition-20260725/corrected-capture.tar.gz",
+    "bytes": 373893,
+    "sha256": "b0867b3e09a5ab5fbf2613fdf42aa1ff30c3b677150518ee253929a1035967c4",
+    "description": "Immutable corrected proof handoff, including segment/fold ELFs, prepared segment inputs, expected public values, manifest, and SHA256SUMS."
+  },
+  "publication": {
+    "proofArtifactsCommitted": true,
+    "correctedCaptureCommitted": true,
+    "archivesCommitted": false,
+    "note": "Validated proof bytes and the immutable corrected capture are committed. Operational recovery and incident archives remain local."
+  }
+}

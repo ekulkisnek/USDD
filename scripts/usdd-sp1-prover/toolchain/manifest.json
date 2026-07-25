@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "name": "USDD_SP1_6_3_1_HOST_ORCHESTRATION_PATCH_V1",
+  "upstream": {
+    "repository": "https://github.com/succinctlabs/sp1",
+    "tag": "v6.3.1",
+    "commit": "8252c2905ce32964df68248117015c61ebb854db"
+  },
+  "circuitCompatibility": {
+    "path": "sp1-prover-6.3.1/SP1_CIRCUIT_VERSION",
+    "value": "v6.1.0",
+    "sha256": "6e08f6ed82d942b8178a610de497297e2e4c1a3f7f864b26e0afd0c301f227cd"
+  },
+  "archives": {
+    "sp1-prover-6.3.1": {
+      "url": "https://static.crates.io/crates/sp1-prover/sp1-prover-6.3.1.crate",
+      "sha256": "ee3b14f599150ddbd3d3829ec4080dc9e10d6dac66e9741260d5a5a116fbcb02"
+    },
+    "sp1-sdk-6.3.1": {
+      "url": "https://static.crates.io/crates/sp1-sdk/sp1-sdk-6.3.1.crate",
+      "sha256": "ac474619d83bd48d3bec8ffea7e620c6f490223a399f3ff8ad4826c146c25bef"
+    }
+  },
+  "patcher": {
+    "path": "patch_sp1_6_3_1.py",
+    "sha256": "4b3debba468007ea0dfee2b6e026d571fca4598e948a5fccfdb53aedeab63b1a"
+  },
+  "modifiedFiles": {
+    "sp1-prover-6.3.1/src/worker/builder.rs": {
+      "upstreamSha256": "89b35def2276dab5d4298b9dca9622073cb5599f29d05f661236c1d4f02c5483",
+      "patchedSha256": "16f110a19255b371c790a9f97bd72effe0f585a3573ae332705758599f9b5b99"
+    },
+    "sp1-prover-6.3.1/src/worker/controller/mod.rs": {
+      "upstreamSha256": "d19d8eb282e7173e0c196c9253450cb4e1a63caa5efb6b5c16a89af97c92aa9d",
+      "patchedSha256": "43526a45525d5f46bfdaff5d63833b5b79517ced10a5e00449af5a484db76b75"
+    },
+    "sp1-prover-6.3.1/src/worker/node/full/init.rs": {
+      "upstreamSha256": "2648b3193da6b473e0bcc02b92baf78e8f70c0d176b1b68814eca2b647c4225a",
+      "patchedSha256": "205125810a36365b4369ea050127712da030f7fbc9e2410a1b163dd8c0f0fd69"
+    },
+    "sp1-prover-6.3.1/src/worker/node/full/mod.rs": {
+      "upstreamSha256": "ed70856fc9b5ab73b380cfd7f7aca912c0261d2fd3fd818f3f2989d21fb9e76f",
+      "patchedSha256": "f333722dffc014678a298c8dababcf7748f9d0aefdf60f92a9a45ce731cc5de2"
+    },
+    "sp1-prover-6.3.1/src/worker/prover/core.rs": {
+      "upstreamSha256": "4151befb3ddbc03b9fd26ad2e0be95b754f62f232304e3f0dae073bf38d44276",
+      "patchedSha256": "12a5998ca7bc412ffa15de03aa93ffae7e663181b25f4dd86695d3e0fbc4e4dd"
+    },
+    "sp1-prover-6.3.1/src/worker/prover/recursion.rs": {
+      "upstreamSha256": "36914346906508ad6673fb65221ea3b00997c4028ea99d5fc36067abcb7b935c",
+      "patchedSha256": "5b93f84d7239fe7acad2d5bf8ec71670cd3b1d764a81d8c273c739a9ad09bc3a"
+    },
+    "sp1-sdk-6.3.1/src/cpu/prove.rs": {
+      "upstreamSha256": "20823069c29c5f58fb0dc1e253d24edc92a0dbfb19137cf5de1f3673809c1d0d",
+      "patchedSha256": "a3b2af37e36ee7c48421a5b53b4844a5c3c0138e83d78d3079259c1367d21f67"
+    },
+    "sp1-sdk-6.3.1/src/cpu/mod.rs": {
+      "upstreamSha256": "1fa72b3e0cbd4578e416fb0ae4d5c4b171ffd8b84d14f5da5d79f2a4d586ea02",
+      "patchedSha256": "6179c9523dcc490ad3fff5fb373e12577de7fb90a0bed029fce7ca3aaa7ca99b"
+    }
+  },
+  "hostOnlyInvariants": [
+    "guest ELF bytes and program ID are unchanged",
+    "recursion programs, vkey map/root, FRI parameters and proof serialization are unchanged",
+    "one-shot vkey hints are keyed by a fresh per-proof ELF artifact and removed by a synchronous drop guard on success, error, panic unwind or async cancellation",
+    "each core shard compares its ELF-derived vkey with the supplied full vkey",
+    "compose and deferred expected vkeys are retained while their proving keys are rebuilt serially on demand and dropped",
+    "each on-demand recursion proving key must derive the retained exact vkey",
+    "the low-memory host may serialize the shared core, recursion, shrink, and wrap proving semaphore without changing any prover circuit or verification key",
+    "intermediate proof and recursion-vkey verification remain enabled",
+    "proof nonce occupies controller input slot four; slot three remains the cycle-limit field",
+    "SDK proof wrappers use the authenticated v6.1.0 circuit compatibility tag, distinct from package release 6.3.1"
+  ],
+  "canonicalProofNonceU32LittleEndianWords": [
+    "0x55534444",
+    "0x45544831",
+    "0x00000001",
+    "0xa11d6e5e"
+  ],
+  "validationScope": "SOURCE_HASHES_EXACT_TRANSFORM_RELEASE_BUILD_AND_LOCAL_UNIT_TESTS_NO_PROVER_INITIALIZATION"
+}

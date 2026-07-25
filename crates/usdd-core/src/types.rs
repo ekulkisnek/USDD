@@ -2,11 +2,10 @@ use alloc::vec::Vec;
 use core::{fmt, str::FromStr};
 
 use crate::{
-    burn_accumulator::burn_accumulator_empty,
     encoding::{CanonicalDecode, CanonicalEncode, DecodeError, Decoder},
     hash::{decode_hex, hash_bytes, Hash32, HexError},
-    usdd_base_to_usdt_micro, usdt_micro_to_usdd_base, ENCODING_SCHEMA, MAX_BURN_AMOUNT_USDD_BASE,
-    MAX_BURN_AMOUNT_USDT_MICRO, MAX_BURN_APPENDS_PER_STATE_TRANSITION,
+    usdd_base_to_usdt_micro, usdt_micro_to_usdd_base, ENCODING_SCHEMA,
+    MAX_APPROVED_CLAIMS_PER_ROOT_UPDATE, MAX_BURN_AMOUNT_USDD_BASE, MAX_BURN_AMOUNT_USDT_MICRO,
     MAX_DEPOSIT_AMOUNT_USDT_MICRO, MAX_ETHEREUM_FINALITY_SLOT_GAP,
     MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS, MAX_MINT_BATCH_USDD_BASE, MAX_MINT_BATCH_USDT_MICRO,
     USDD_UNITS_PER_USDT_MICRO,
@@ -22,10 +21,11 @@ pub const SOLIDITY_DEPOSIT_ID_DOMAIN: Hash32 = Hash32([
     0x50, 0xdb, 0xf7, 0xe1, 0x05, 0x34, 0xed, 0x34, 0xae, 0xcd, 0xc7, 0x8d, 0x20, 0x3b, 0x88, 0xe0,
 ]);
 
-/// `keccak256("USDD_BURN_LEAF_V1")`, matching `USDDVaultV1.sol`.
-pub const SOLIDITY_BURN_LEAF_DOMAIN: Hash32 = Hash32([
-    0xb1, 0x5e, 0x96, 0x91, 0x0e, 0x56, 0x01, 0x34, 0x06, 0xf4, 0x16, 0x7f, 0x79, 0xc8, 0xb6, 0xe3,
-    0x69, 0xc3, 0xab, 0xf0, 0xb4, 0x09, 0xd5, 0x0a, 0x63, 0xe9, 0x9e, 0x09, 0x5b, 0x25, 0xfb, 0x94,
+/// `keccak256("USDD_BIP300_REDEMPTION_LEAF_V1")`, matching
+/// `USDDVaultV1.sol`.
+pub const SOLIDITY_APPROVED_REDEMPTION_LEAF_DOMAIN: Hash32 = Hash32([
+    0xa2, 0x04, 0x23, 0x80, 0x92, 0x68, 0x79, 0x09, 0x8c, 0x0f, 0x42, 0x3f, 0x49, 0xe3, 0xa0, 0x7a,
+    0x12, 0x48, 0xed, 0x08, 0x53, 0x57, 0x93, 0xa4, 0xa1, 0xc4, 0xaf, 0xe6, 0x2d, 0x99, 0x88, 0x69,
 ]);
 
 /// `SHA256("USDD_BURN_ID_V1")`, shared by Elements, guests, and vaults.
@@ -40,8 +40,8 @@ const TAG_MINT_OUTPUT: u16 = 0x0103;
 const TAG_MINT_BATCH: u16 = 0x0104;
 const TAG_BURN: u16 = 0x0201;
 const TAG_ELEMENTS_EVENT: u16 = 0x0202;
-const TAG_SOLIDITY_BURN_CLAIM: u16 = 0x0203;
-const TAG_SOLIDITY_ELEMENTS_STATE: u16 = 0x0204;
+const TAG_REDEMPTION_CLAIM: u16 = 0x0203;
+const TAG_APPROVED_REDEMPTION_STATE: u16 = 0x0204;
 
 fn encode_header(tag: u16, out: &mut Vec<u8>) {
     ENCODING_SCHEMA.encode_to(out);
@@ -573,6 +573,18 @@ impl Burn {
         Ok(())
     }
 
+    /// Apply the immutable Ethereum vault's no-self-payout rule when the
+    /// deployment address is available.
+    pub fn validate_for_vault(&self, expected_vault: EthAddress) -> Result<(), DecodeError> {
+        self.validate()?;
+        if expected_vault.is_zero() || self.ethereum_destination == expected_vault {
+            return Err(DecodeError::InvalidValue(
+                "burn destination must not be the configured vault",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn redemption_id(&self, elements_genesis: Hash32) -> Hash32 {
         let mut payload = Vec::with_capacity(100);
         BURN_ID_DOMAIN.encode_to(&mut payload);
@@ -591,8 +603,8 @@ impl Burn {
         }
     }
 
-    pub fn solidity_claim(&self, elements_genesis: Hash32) -> SolidityBurnClaim {
-        SolidityBurnClaim {
+    pub fn redemption_claim(&self, elements_genesis: Hash32) -> RedemptionClaim {
+        RedemptionClaim {
             protocol_version: PROTOCOL_VERSION,
             elements_genesis_hash: elements_genesis,
             usdd_asset_id: self.usdd_asset,
@@ -603,6 +615,11 @@ impl Burn {
             amount_usdt_micro: self.usdt_amount_micro,
             recipient: self.ethereum_destination,
         }
+    }
+
+    /// Backward-compatible constructor name for the same fixed claim fields.
+    pub fn solidity_claim(&self, elements_genesis: Hash32) -> RedemptionClaim {
+        self.redemption_claim(elements_genesis)
     }
 }
 
@@ -684,9 +701,10 @@ impl CanonicalDecode for Burn {
     }
 }
 
-/// Exact fixed-width claim consumed by `USDDVaultV1.hashBurnLeaf`.
+/// Exact fixed-width claim consumed by
+/// `USDDVaultV1.hashApprovedRedemptionLeaf` after BIP300 M6 approval.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SolidityBurnClaim {
+pub struct RedemptionClaim {
     pub protocol_version: u32,
     pub elements_genesis_hash: Hash32,
     pub usdd_asset_id: Hash32,
@@ -698,7 +716,7 @@ pub struct SolidityBurnClaim {
     pub recipient: EthAddress,
 }
 
-impl SolidityBurnClaim {
+impl RedemptionClaim {
     pub fn validate(&self) -> Result<(), DecodeError> {
         if self.protocol_version != PROTOCOL_VERSION
             || self.elements_genesis_hash == Hash32::ZERO
@@ -707,9 +725,10 @@ impl SolidityBurnClaim {
             || self.burn_txid_display == Hash32::ZERO
             || self.burn_id == Hash32::ZERO
             || self.amount_usdt_micro == 0
+            || self.amount_usdt_micro > MAX_BURN_AMOUNT_USDT_MICRO
             || self.recipient.is_zero()
         {
-            return Err(DecodeError::InvalidValue("invalid Solidity burn claim"));
+            return Err(DecodeError::InvalidValue("invalid redemption claim"));
         }
         let mut identity_preimage = Vec::with_capacity(100);
         BURN_ID_DOMAIN.encode_to(&mut identity_preimage);
@@ -722,27 +741,46 @@ impl SolidityBurnClaim {
         Ok(())
     }
 
-    pub fn burn_leaf(&self, burn_index: u64) -> Result<Hash32, DecodeError> {
+    /// Apply the Ethereum vault's destination rule when the deployment address
+    /// is available. The fixed claim bytes carry `vault_id`, not the address,
+    /// so context-free decoding cannot enforce this rule by itself.
+    pub fn validate_for_vault(&self, expected_vault: EthAddress) -> Result<(), DecodeError> {
+        self.validate()?;
+        if expected_vault.is_zero() || self.recipient == expected_vault {
+            return Err(DecodeError::InvalidValue(
+                "redemption recipient must not be the configured vault",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn approved_redemption_leaf(&self, claim_index: u64) -> Result<Hash32, DecodeError> {
         self.validate()?;
         let mut preimage = Vec::with_capacity(201);
         0u8.encode_to(&mut preimage);
-        SOLIDITY_BURN_LEAF_DOMAIN.encode_to(&mut preimage);
+        SOLIDITY_APPROVED_REDEMPTION_LEAF_DOMAIN.encode_to(&mut preimage);
         self.protocol_version.encode_to(&mut preimage);
         self.elements_genesis_hash.encode_to(&mut preimage);
         self.usdd_asset_id.encode_to(&mut preimage);
         self.vault_id.encode_to(&mut preimage);
         self.burn_id.encode_to(&mut preimage);
-        burn_index.encode_to(&mut preimage);
+        claim_index.encode_to(&mut preimage);
         self.amount_usdt_micro.encode_to(&mut preimage);
         self.recipient.encode_to(&mut preimage);
         debug_assert_eq!(preimage.len(), 201);
         Ok(hash_bytes(&preimage))
     }
+
+    /// Backward-compatible method name. The leaf is authorization evidence
+    /// from an approved BIP300 bundle, not proof of Elements burn validity.
+    pub fn burn_leaf(&self, claim_index: u64) -> Result<Hash32, DecodeError> {
+        self.approved_redemption_leaf(claim_index)
+    }
 }
 
-impl CanonicalEncode for SolidityBurnClaim {
+impl CanonicalEncode for RedemptionClaim {
     fn encode_to(&self, out: &mut Vec<u8>) {
-        encode_header(TAG_SOLIDITY_BURN_CLAIM, out);
+        encode_header(TAG_REDEMPTION_CLAIM, out);
         self.protocol_version.encode_to(out);
         self.elements_genesis_hash.encode_to(out);
         self.usdd_asset_id.encode_to(out);
@@ -755,9 +793,9 @@ impl CanonicalEncode for SolidityBurnClaim {
     }
 }
 
-impl CanonicalDecode for SolidityBurnClaim {
+impl CanonicalDecode for RedemptionClaim {
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_header(decoder, TAG_SOLIDITY_BURN_CLAIM)?;
+        decode_header(decoder, TAG_REDEMPTION_CLAIM)?;
         let value = Self {
             protocol_version: decoder.u32()?,
             elements_genesis_hash: Hash32::decode_from(decoder)?,
@@ -773,6 +811,9 @@ impl CanonicalDecode for SolidityBurnClaim {
         Ok(value)
     }
 }
+
+/// Compatibility alias for callers which used the pre-BIP300-approval name.
+pub type SolidityBurnClaim = RedemptionClaim;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -858,35 +899,34 @@ impl CanonicalDecode for ElementsEvent {
     }
 }
 
-/// Exact state tuple consumed by `USDDVaultV1.elementsStateStatement`.
+/// Exact state tuple consumed by `USDDVaultV1.approvedRedemptionStatement`.
+///
+/// This records a BIP300 withdrawal-bundle approval and an append-only root of
+/// the redemption claims in that bundle. It deliberately makes no assertion
+/// that an Elements transaction or block was consensus-valid.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SolidityElementsBridgeState {
+pub struct ApprovedRedemptionState {
     pub sequence: u64,
-    pub burn_count: u64,
-    pub elements_tip_hash: Hash32,
-    /// Commitment to the deterministic full Elements consensus state needed
-    /// to continue validation incrementally (including the UTXO set and the
-    /// consensus/activation context at `elements_tip_hash`).
-    pub elements_consensus_state_digest: Hash32,
-    pub cumulative_burn_root: Hash32,
-    pub finalized_bitcoin_block_hash: Hash32,
+    pub approved_claim_count: u64,
+    pub cumulative_approved_claim_root: Hash32,
+    /// Canonical RPC/display hex bytes, left-to-right with no reversal.
+    pub approved_m6id: Hash32,
+    /// Canonical RPC/display hex bytes, left-to-right with no reversal.
+    pub bitcoin_tip_hash: Hash32,
     pub bitcoin_height: u64,
-    pub elements_height: u64,
     pub bitcoin_median_time_past: u64,
     /// Big-endian uint256.
     pub bitcoin_chainwork: Hash32,
 }
 
-impl SolidityElementsBridgeState {
+impl ApprovedRedemptionState {
     pub fn is_zero(&self) -> bool {
         self.sequence == 0
-            && self.burn_count == 0
-            && self.elements_tip_hash == Hash32::ZERO
-            && self.elements_consensus_state_digest == Hash32::ZERO
-            && self.cumulative_burn_root == Hash32::ZERO
-            && self.finalized_bitcoin_block_hash == Hash32::ZERO
+            && self.approved_claim_count == 0
+            && self.cumulative_approved_claim_root == Hash32::ZERO
+            && self.approved_m6id == Hash32::ZERO
+            && self.bitcoin_tip_hash == Hash32::ZERO
             && self.bitcoin_height == 0
-            && self.elements_height == 0
             && self.bitcoin_median_time_past == 0
             && self.bitcoin_chainwork == Hash32::ZERO
     }
@@ -895,21 +935,14 @@ impl SolidityElementsBridgeState {
         if self.is_zero() {
             return Ok(());
         }
-        if self.elements_tip_hash == Hash32::ZERO
-            || self.elements_consensus_state_digest == Hash32::ZERO
-            || self.cumulative_burn_root == Hash32::ZERO
-            || self.finalized_bitcoin_block_hash == Hash32::ZERO
+        if self.approved_claim_count == 0
+            || self.cumulative_approved_claim_root == Hash32::ZERO
+            || self.approved_m6id == Hash32::ZERO
+            || self.bitcoin_tip_hash == Hash32::ZERO
             || self.bitcoin_chainwork == Hash32::ZERO
         {
-            return Err(DecodeError::InvalidValue("invalid Solidity Elements state"));
-        }
-        if self.burn_count == 0
-            && self.cumulative_burn_root
-                != burn_accumulator_empty(64)
-                    .expect("V1 burn accumulator depth is statically valid")
-        {
             return Err(DecodeError::InvalidValue(
-                "noncanonical empty burn accumulator root",
+                "invalid approved redemption state",
             ));
         }
         Ok(())
@@ -919,67 +952,62 @@ impl SolidityElementsBridgeState {
         self.validate()?;
         next.validate()?;
         if next.is_zero() {
-            return Err(DecodeError::InvalidValue("zero successor Elements state"));
+            return Err(DecodeError::InvalidValue(
+                "zero successor approved redemption state",
+            ));
         }
         if next.sequence
             != self
                 .sequence
                 .checked_add(1)
                 .ok_or(DecodeError::InvalidValue(
-                    "Elements state sequence overflow",
+                    "approved redemption sequence overflow",
                 ))?
         {
-            return Err(DecodeError::InvalidValue("wrong Elements state sequence"));
-        }
-        if next.burn_count < self.burn_count {
-            return Err(DecodeError::InvalidValue("burn count decreased"));
-        }
-        if next.burn_count - self.burn_count > MAX_BURN_APPENDS_PER_STATE_TRANSITION as u64 {
             return Err(DecodeError::InvalidValue(
-                "too many burns in one Elements state transition",
+                "wrong approved redemption state sequence",
             ));
         }
-        if self.sequence != 0
-            && next.burn_count == self.burn_count
-            && next.cumulative_burn_root != self.cumulative_burn_root
+        if next.approved_claim_count <= self.approved_claim_count {
+            return Err(DecodeError::InvalidValue("no new approved claims"));
+        }
+        if next.approved_claim_count - self.approved_claim_count
+            > MAX_APPROVED_CLAIMS_PER_ROOT_UPDATE as u64
         {
             return Err(DecodeError::InvalidValue(
-                "burn root changed without a burn",
+                "too many claims in one approved bundle",
             ));
         }
-        if self.sequence != 0
-            && next.elements_consensus_state_digest == self.elements_consensus_state_digest
+        if next.cumulative_approved_claim_root == self.cumulative_approved_claim_root
+            || next.approved_m6id == self.approved_m6id
         {
             return Err(DecodeError::InvalidValue(
-                "Elements consensus state digest did not advance",
+                "approved root or M6id did not advance",
             ));
         }
         if next.bitcoin_height <= self.bitcoin_height
-            || next.elements_height <= self.elements_height
             || next.bitcoin_median_time_past < self.bitcoin_median_time_past
             || next.bitcoin_chainwork <= self.bitcoin_chainwork
         {
             return Err(DecodeError::InvalidValue(
-                "Elements/Bitcoin finalized context did not advance",
+                "Bitcoin approval context did not advance",
             ));
         }
         Ok(())
     }
 
-    /// Solidity `abi.encodePacked` state contents (200 bytes, no Rust tag).
+    /// Solidity `abi.encodePacked` state contents (160 bytes, no Rust tag).
     pub fn packed_contents(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(200);
+        let mut out = Vec::with_capacity(160);
         self.sequence.encode_to(&mut out);
-        self.burn_count.encode_to(&mut out);
-        self.elements_tip_hash.encode_to(&mut out);
-        self.elements_consensus_state_digest.encode_to(&mut out);
-        self.cumulative_burn_root.encode_to(&mut out);
-        self.finalized_bitcoin_block_hash.encode_to(&mut out);
+        self.approved_claim_count.encode_to(&mut out);
+        self.cumulative_approved_claim_root.encode_to(&mut out);
+        self.approved_m6id.encode_to(&mut out);
+        self.bitcoin_tip_hash.encode_to(&mut out);
         self.bitcoin_height.encode_to(&mut out);
-        self.elements_height.encode_to(&mut out);
         self.bitcoin_median_time_past.encode_to(&mut out);
         self.bitcoin_chainwork.encode_to(&mut out);
-        debug_assert_eq!(out.len(), 200);
+        debug_assert_eq!(out.len(), 160);
         out
     }
 
@@ -988,27 +1016,100 @@ impl SolidityElementsBridgeState {
     }
 }
 
-impl CanonicalEncode for SolidityElementsBridgeState {
+impl CanonicalEncode for ApprovedRedemptionState {
     fn encode_to(&self, out: &mut Vec<u8>) {
-        encode_header(TAG_SOLIDITY_ELEMENTS_STATE, out);
+        encode_header(TAG_APPROVED_REDEMPTION_STATE, out);
         out.extend_from_slice(&self.packed_contents());
     }
 }
 
-impl CanonicalDecode for SolidityElementsBridgeState {
+impl CanonicalDecode for ApprovedRedemptionState {
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_header(decoder, TAG_SOLIDITY_ELEMENTS_STATE)?;
+        decode_header(decoder, TAG_APPROVED_REDEMPTION_STATE)?;
         let value = Self {
             sequence: decoder.u64()?,
-            burn_count: decoder.u64()?,
-            elements_tip_hash: Hash32::decode_from(decoder)?,
-            elements_consensus_state_digest: Hash32::decode_from(decoder)?,
-            cumulative_burn_root: Hash32::decode_from(decoder)?,
-            finalized_bitcoin_block_hash: Hash32::decode_from(decoder)?,
+            approved_claim_count: decoder.u64()?,
+            cumulative_approved_claim_root: Hash32::decode_from(decoder)?,
+            approved_m6id: Hash32::decode_from(decoder)?,
+            bitcoin_tip_hash: Hash32::decode_from(decoder)?,
             bitcoin_height: decoder.u64()?,
-            elements_height: decoder.u64()?,
             bitcoin_median_time_past: decoder.u64()?,
             bitcoin_chainwork: Hash32::decode_from(decoder)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+/// Immutable post-genesis identities authenticated by the controller's state
+/// Taproot sibling and repeated in every inbound proof journal.
+///
+/// Elements RPC displays asset IDs, entropy, and blinding factors in reverse
+/// uint256 order. These fields deliberately use transaction-consensus byte
+/// order so Simplicity can compare them directly to transaction jets. The
+/// generator x-coordinate is already wire order and is never reversed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControllerRuntimeConfig {
+    pub usdd_asset_consensus: Hash32,
+    pub reissuance_token_consensus: Hash32,
+    pub public_abf_consensus: Hash32,
+    pub issuance_entropy_consensus: Hash32,
+    /// Low bit of the serialized 0x0a/0x0b confidential asset prefix.
+    pub token_generator_parity: u8,
+    pub token_generator_x: Hash32,
+    pub policy_asset_consensus: Hash32,
+}
+
+impl ControllerRuntimeConfig {
+    pub const ENCODED_LEN: usize = 193;
+
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.usdd_asset_consensus == Hash32::ZERO
+            || self.reissuance_token_consensus == Hash32::ZERO
+            || self.public_abf_consensus == Hash32::ZERO
+            || self.issuance_entropy_consensus == Hash32::ZERO
+            || self.token_generator_x == Hash32::ZERO
+            || self.policy_asset_consensus == Hash32::ZERO
+            || self.token_generator_parity > 1
+        {
+            return Err(DecodeError::InvalidValue(
+                "invalid controller runtime configuration",
+            ));
+        }
+        if self.usdd_asset_consensus == self.reissuance_token_consensus
+            || self.usdd_asset_consensus == self.policy_asset_consensus
+            || self.reissuance_token_consensus == self.policy_asset_consensus
+        {
+            return Err(DecodeError::InvalidValue(
+                "controller assets must be distinct",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for ControllerRuntimeConfig {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.usdd_asset_consensus.encode_to(out);
+        self.reissuance_token_consensus.encode_to(out);
+        self.public_abf_consensus.encode_to(out);
+        self.issuance_entropy_consensus.encode_to(out);
+        self.token_generator_parity.encode_to(out);
+        self.token_generator_x.encode_to(out);
+        self.policy_asset_consensus.encode_to(out);
+    }
+}
+
+impl CanonicalDecode for ControllerRuntimeConfig {
+    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            usdd_asset_consensus: Hash32::decode_from(decoder)?,
+            reissuance_token_consensus: Hash32::decode_from(decoder)?,
+            public_abf_consensus: Hash32::decode_from(decoder)?,
+            issuance_entropy_consensus: Hash32::decode_from(decoder)?,
+            token_generator_parity: decoder.u8()?,
+            token_generator_x: Hash32::decode_from(decoder)?,
+            policy_asset_consensus: Hash32::decode_from(decoder)?,
         };
         value.validate()?;
         Ok(value)
@@ -1027,11 +1128,13 @@ pub struct MintControllerState {
     pub finalized_beacon_root: Hash32,
     pub finalized_execution_state_root: Hash32,
     pub total_minted_usdd_base: u64,
+    pub runtime_config: ControllerRuntimeConfig,
     pub configuration_hash: Hash32,
 }
 
 impl MintControllerState {
     pub fn bootstrap(
+        runtime_config: ControllerRuntimeConfig,
         configuration_hash: Hash32,
         first_mint_nonce: u64,
         finality: &EthereumFinalityWitness,
@@ -1046,6 +1149,7 @@ impl MintControllerState {
             finalized_beacon_root: finality.finalized_beacon_root,
             finalized_execution_state_root: finality.finalized_execution_state_root,
             total_minted_usdd_base: 0,
+            runtime_config,
             configuration_hash,
         };
         value.validate()?;
@@ -1059,6 +1163,7 @@ impl MintControllerState {
         {
             return Err(DecodeError::InvalidValue("invalid controller identity"));
         }
+        self.runtime_config.validate()?;
         if self.finalized_beacon_slot == 0 {
             if self.sequence != 0
                 || self.total_minted_usdd_base != 0
@@ -1107,6 +1212,7 @@ impl MintControllerState {
                 .total_minted_usdd_base
                 .checked_add(batch.total_usdd_amount_base)
                 .ok_or(DecodeError::InvalidValue("minted supply overflow"))?,
+            runtime_config: self.runtime_config.clone(),
             configuration_hash: self.configuration_hash,
         };
         next.validate()?;
@@ -1136,6 +1242,7 @@ impl MintControllerState {
             finalized_beacon_root: finality.finalized_beacon_root,
             finalized_execution_state_root: finality.finalized_execution_state_root,
             total_minted_usdd_base: self.total_minted_usdd_base,
+            runtime_config: self.runtime_config.clone(),
             configuration_hash: self.configuration_hash,
         };
         next.validate()?;
@@ -1212,6 +1319,7 @@ impl CanonicalEncode for MintControllerState {
         self.finalized_beacon_root.encode_to(out);
         self.finalized_execution_state_root.encode_to(out);
         self.total_minted_usdd_base.encode_to(out);
+        self.runtime_config.encode_to(out);
         self.configuration_hash.encode_to(out);
     }
 }
@@ -1227,6 +1335,7 @@ impl CanonicalDecode for MintControllerState {
             finalized_beacon_root: Hash32::decode_from(decoder)?,
             finalized_execution_state_root: Hash32::decode_from(decoder)?,
             total_minted_usdd_base: decoder.u64()?,
+            runtime_config: ControllerRuntimeConfig::decode_from(decoder)?,
             configuration_hash: Hash32::decode_from(decoder)?,
         };
         value.validate()?;
@@ -1234,8 +1343,8 @@ impl CanonicalDecode for MintControllerState {
     }
 }
 
-/// Backward-compatible name. This is the 164-byte Elements mint-controller
-/// state, never the Solidity vault's outbound `ElementsBridgeState`.
+/// Backward-compatible name. This is the 357-byte Elements mint-controller
+/// state, never the Solidity vault's `ApprovedRedemptionState`.
 pub type BridgeState = MintControllerState;
 
 #[cfg(test)]
@@ -1275,13 +1384,26 @@ mod tests {
         }
     }
 
+    fn runtime_config() -> ControllerRuntimeConfig {
+        ControllerRuntimeConfig {
+            usdd_asset_consensus: hash(20),
+            reissuance_token_consensus: hash(21),
+            public_abf_consensus: hash(22),
+            issuance_entropy_consensus: hash(23),
+            token_generator_parity: 1,
+            token_generator_x: hash(24),
+            policy_asset_consensus: hash(25),
+        }
+    }
+
     fn controller(first_nonce: u64) -> MintControllerState {
         let mut bootstrap_finality = finality();
         bootstrap_finality.finalized_beacon_slot = 1;
         bootstrap_finality.finalized_beacon_root = hash(11);
         bootstrap_finality.finalized_execution_state_root = hash(12);
         bootstrap_finality.ethereum_light_client_digest = hash(13);
-        MintControllerState::bootstrap(hash(9), first_nonce, &bootstrap_finality).unwrap()
+        MintControllerState::bootstrap(runtime_config(), hash(9), first_nonce, &bootstrap_finality)
+            .unwrap()
     }
 
     #[test]
@@ -1414,49 +1536,45 @@ mod tests {
     }
 
     #[test]
-    fn outbound_state_requires_an_advancing_consensus_digest() {
-        let zero = SolidityElementsBridgeState {
+    fn approved_redemption_state_requires_new_claims_and_m6id() {
+        let zero = ApprovedRedemptionState {
             sequence: 0,
-            burn_count: 0,
-            elements_tip_hash: Hash32::ZERO,
-            elements_consensus_state_digest: Hash32::ZERO,
-            cumulative_burn_root: Hash32::ZERO,
-            finalized_bitcoin_block_hash: Hash32::ZERO,
+            approved_claim_count: 0,
+            cumulative_approved_claim_root: Hash32::ZERO,
+            approved_m6id: Hash32::ZERO,
+            bitcoin_tip_hash: Hash32::ZERO,
             bitcoin_height: 0,
-            elements_height: 0,
             bitcoin_median_time_past: 0,
             bitcoin_chainwork: Hash32::ZERO,
         };
-        let first = SolidityElementsBridgeState {
+        let first = ApprovedRedemptionState {
             sequence: 1,
-            burn_count: 0,
-            elements_tip_hash: hash(21),
-            elements_consensus_state_digest: hash(22),
-            cumulative_burn_root: burn_accumulator_empty(64).unwrap(),
-            finalized_bitcoin_block_hash: hash(24),
+            approved_claim_count: 1,
+            cumulative_approved_claim_root: hash(21),
+            approved_m6id: hash(22),
+            bitcoin_tip_hash: hash(24),
             bitcoin_height: 100,
-            elements_height: 10,
             bitcoin_median_time_past: 1_700_000_000,
             bitcoin_chainwork: hash(25),
         };
         zero.validate_successor(&first).unwrap();
-        assert_eq!(first.packed_contents().len(), 200);
+        assert_eq!(first.packed_contents().len(), 160);
 
         let mut second = first.clone();
         second.sequence = 2;
-        second.elements_tip_hash = hash(26);
-        second.finalized_bitcoin_block_hash = hash(27);
+        second.approved_claim_count += 1;
+        second.cumulative_approved_claim_root = hash(26);
+        second.bitcoin_tip_hash = hash(27);
         second.bitcoin_height += 1;
-        second.elements_height += 1;
         second.bitcoin_median_time_past += 1;
         second.bitcoin_chainwork = hash(28);
         assert!(first.validate_successor(&second).is_err());
-        second.elements_consensus_state_digest = hash(29);
+        second.approved_m6id = hash(29);
         first.validate_successor(&second).unwrap();
 
         let encoded = second.encode();
         assert_eq!(
-            SolidityElementsBridgeState::decode_exact(&encoded).unwrap(),
+            ApprovedRedemptionState::decode_exact(&encoded).unwrap(),
             second
         );
     }
@@ -1495,5 +1613,30 @@ mod tests {
         burn.usdt_amount_micro += 1;
         assert!(burn.validate().is_err());
         assert!(burn.burn_payload().validate().is_err());
+    }
+
+    #[test]
+    fn redemption_claim_matches_vault_amount_and_destination_rules() {
+        let burn = Burn {
+            vault_id: hash(1),
+            usdd_asset: hash(2),
+            usdd_amount_base: MAX_BURN_AMOUNT_USDD_BASE,
+            usdt_amount_micro: MAX_BURN_AMOUNT_USDT_MICRO,
+            burn_outpoint: OutPoint {
+                txid: hash(3),
+                vout: 0,
+            },
+            ethereum_destination: address(4),
+        };
+        let mut claim = burn.redemption_claim(hash(5));
+        burn.validate_for_vault(address(6)).unwrap();
+        assert!(burn.validate_for_vault(address(4)).is_err());
+        claim.validate_for_vault(address(6)).unwrap();
+        assert!(claim.validate_for_vault(address(4)).is_err());
+        claim.amount_usdt_micro += 1;
+        assert!(claim.validate().is_err());
+        claim.amount_usdt_micro = 1;
+        claim.burn_txid_display = Hash32::ZERO;
+        assert!(claim.validate().is_err());
     }
 }

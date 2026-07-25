@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod audit;
+pub mod bip301_checkpoint;
 pub mod burn_accumulator;
 pub mod encoding;
 #[cfg(feature = "std")]
@@ -10,11 +11,16 @@ pub mod gates;
 pub mod hash;
 pub mod manifest;
 pub mod merkle;
+pub mod relay_config;
 pub mod types;
 
 pub use audit::{
     reconstruct_audit_snapshot, AuditError, AuditReport, AuditSnapshot, AuditedBurn,
     AuditedDeposit, AuditedMint, AuditedPayout,
+};
+pub use bip301_checkpoint::{
+    Bip301CheckpointError, Bip301CheckpointTransition, BIP301_CHECKPOINT_DOMAIN,
+    BIP301_CHECKPOINT_PREIMAGE_LENGTH, BIP301_CHECKPOINT_VERSION,
 };
 pub use burn_accumulator::{
     burn_accumulator_empty, burn_accumulator_node, BurnAccumulator, BurnAccumulatorError,
@@ -32,15 +38,22 @@ pub use merkle::{
     empty_merkle_root, merkle_leaf, merkle_node, merkle_proof, merkle_root, MerkleError,
     MerkleProof,
 };
+pub use relay_config::{
+    AbiUint256, Bip300RelayConfig, RelayConfigCodecError,
+    BIP300_WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD, BIP300_WITHDRAWAL_BUNDLE_MAX_AGE,
+    BITCOIN_BIP300_RELAY_CONFIG_ABI_LENGTH, BITCOIN_BIP300_RELAY_CONFIG_ABI_WORDS,
+    BITCOIN_BIP300_RELAY_CONFIG_DOMAIN, BITCOIN_BIP300_RELAY_CONFIG_FIELD_WORDS,
+    SLOT_24_ACTIVE_BITMAP,
+};
 pub use types::*;
 
 /// Canonical protocol encoding schema.
 ///
 /// Schema 2 removes caller-supplied Bitcoin parent time from Ethereum proof
 /// claims, adds the Ethereum-proved execution timestamp to public values, and
-/// commits the outbound Elements consensus state. Schema 1 is intentionally
-/// rejected to prevent old claim bytes being reinterpreted under the corrected
-/// authorization boundary.
+/// is also the fixed-width envelope used by the reduced BIP300-approved
+/// redemption records. Schema 1 is intentionally rejected to prevent old claim
+/// bytes being reinterpreted under the corrected authorization boundary.
 pub const ENCODING_SCHEMA: u16 = 2;
 
 /// The eCash Elements Drivechain slot committed by this protocol.
@@ -68,7 +81,9 @@ pub const SHA256_DIGEST_TAG: u8 = 1;
 pub const MAX_ETHEREUM_FINALITY_SLOT_GAP: u64 = 4_096;
 pub const MAX_FINALIZED_TO_BMM_MTP_AGE_SECONDS: u64 = 6 * 60 * 60;
 pub const MINIMUM_BITCOIN_CONFIRMATIONS: u32 = 100;
-pub const MAX_BURN_APPENDS_PER_STATE_TRANSITION: usize = 64;
+pub const MAX_APPROVED_CLAIMS_PER_ROOT_UPDATE: usize = 64;
+/// Compatibility name for the unchanged per-batch sparse-Merkle append cap.
+pub const MAX_BURN_APPENDS_PER_STATE_TRANSITION: usize = MAX_APPROVED_CLAIMS_PER_ROOT_UPDATE;
 /// Elements' context-free transaction rule caps the sum of every explicit
 /// output value, across all assets, at 21 million eight-decimal base units.
 pub const ELEMENTS_MAX_EXPLICIT_OUTPUT_TOTAL_BASE: u64 = 21_000_000 * USDD_SCALE;

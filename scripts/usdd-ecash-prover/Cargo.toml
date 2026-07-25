@@ -1,0 +1,27 @@
+[package]
+name = "usdd-ecash-prover"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[patch.crates-io]
+sp1-prover = { path = "../usdd-sp1-prover/toolchain/vendor/sp1-prover-6.3.1" }
+sp1-sdk = { path = "../usdd-sp1-prover/toolchain/vendor/sp1-sdk-6.3.1" }
+
+[dependencies]
+anyhow = "=1.0.102"
+bincode = "=1.3.3"
+hex = "=0.4.3"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.8"
+sp1-core-executor = "=6.3.1"
+sp1-sdk = { version = "=6.3.1", default-features = false }
+tokio = { version = "=1.49.0", features = ["macros", "rt"] }
+usdd-bitcoin-bmm = { path = "../../crates/usdd-bitcoin-bmm" }
+usdd-core = { path = "../../crates/usdd-core", features = ["std"] }
+usdd-ecash-proof-core = { path = "../../crates/usdd-ecash-proof-core", features = ["std"] }

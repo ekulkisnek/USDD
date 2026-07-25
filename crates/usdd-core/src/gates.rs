@@ -9,26 +9,29 @@ use std::{
 
 use crate::hash_bytes;
 
-/// Required evidence gates. A release is blocked unless every entry is a
-/// measured PASS with a non-placeholder evidence reference.
-pub const REQUIRED_LAUNCH_GATES: [&str; 16] = [
+/// Required evidence gates. A release is blocked unless every required entry
+/// is a measured PASS with a non-placeholder evidence reference.
+pub const REQUIRED_LAUNCH_GATES: [&str; 15] = [
     "proof-size",
-    "x86-latency",
-    "arm-latency",
+    "deterministic-verifier-cost",
     "peak-memory",
     "block-weight",
     "evm-gas",
-    "full-validity-invalid-block-rejection",
-    "volume-100k",
-    "soak-90-day",
+    "bip300-authorization-invalid-rejection",
     "sp1-soundness-independent-confirmation",
     "solidity-independent-audit",
     "sp1-guests-independent-audit",
     "elements-simplicity-independent-audit",
     "ethereum-client-differential",
-    "elements-bitcoin-enforcer-differential",
+    "bip300-drivechain-enforcer-differential",
     "cross-domain-replay-fuzz",
+    "deposit-mint-e2e",
+    "approved-redemption-payout-e2e",
 ];
+
+/// Valuable public-testnet maturity observations which are reported when
+/// present but do not redefine cryptographic correctness or block launch.
+pub const OPTIONAL_RELEASE_OBSERVATIONS: [&str; 2] = ["volume-100k", "soak-90-day"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GateStatus {
@@ -100,7 +103,8 @@ impl GateReport {
                 });
             }
             let id = columns[0];
-            if !REQUIRED_LAUNCH_GATES.contains(&id) {
+            if !REQUIRED_LAUNCH_GATES.contains(&id) && !OPTIONAL_RELEASE_OBSERVATIONS.contains(&id)
+            {
                 return Err(GateError::UnknownGate(id.to_owned()));
             }
             let entry = GateEntry {
@@ -115,7 +119,7 @@ impl GateReport {
             }
         }
 
-        let entries = REQUIRED_LAUNCH_GATES
+        let mut entries: Vec<_> = REQUIRED_LAUNCH_GATES
             .iter()
             .map(|id| {
                 provided.remove(*id).unwrap_or_else(|| GateEntry {
@@ -127,6 +131,11 @@ impl GateReport {
                 })
             })
             .collect();
+        entries.extend(
+            OPTIONAL_RELEASE_OBSERVATIONS
+                .iter()
+                .filter_map(|id| provided.remove(*id)),
+        );
         Ok(Self { entries })
     }
 
@@ -164,14 +173,20 @@ impl GateReport {
     }
 
     pub fn launch_ready(&self) -> bool {
-        self.entries.len() == REQUIRED_LAUNCH_GATES.len()
-            && self.entries.iter().all(GateEntry::is_measured_pass)
+        REQUIRED_LAUNCH_GATES.iter().all(|required| {
+            self.entries
+                .iter()
+                .find(|entry| entry.id == *required)
+                .is_some_and(GateEntry::is_measured_pass)
+        })
     }
 
     pub fn blocked_count(&self) -> usize {
         self.entries
             .iter()
-            .filter(|entry| !entry.is_measured_pass())
+            .filter(|entry| {
+                REQUIRED_LAUNCH_GATES.contains(&entry.id.as_str()) && !entry.is_measured_pass()
+            })
             .count()
     }
 
@@ -186,6 +201,9 @@ impl GateReport {
                 "BLOCKED"
             };
             output.push_str(&entry.id);
+            if OPTIONAL_RELEASE_OBSERVATIONS.contains(&entry.id.as_str()) {
+                output.push_str(" [observation]");
+            }
             output.push_str(": ");
             output.push_str(effective);
             output.push_str(" (value=");
@@ -218,14 +236,12 @@ fn parse_evidence_spec(value: &str) -> Option<(&str, &str)> {
 fn meets_gate_criterion(id: &str, value: &str) -> bool {
     let integer = || value.parse::<u64>().ok();
     match id {
-        // Values are raw bytes, milliseconds, bytes, and basis points.
+        // Values are raw bytes, bytes, and basis points unless named otherwise.
         "proof-size" => integer().is_some_and(|number| number <= 512 * 1024),
-        "x86-latency" => integer().is_some_and(|number| number <= 500),
-        "arm-latency" => integer().is_some_and(|number| number <= 2_000),
         "peak-memory" => integer().is_some_and(|number| number <= 256 * 1024 * 1024),
         "block-weight" => integer().is_some_and(|number| number <= 2_500),
         "evm-gas" => integer().is_some_and(|number| number <= 5_000),
-        "full-validity-invalid-block-rejection" => {
+        "bip300-authorization-invalid-rejection" => {
             let Some((rejected, total)) = value.split_once('/') else {
                 return false;
             };
@@ -236,13 +252,16 @@ fn meets_gate_criterion(id: &str, value: &str) -> bool {
         }
         "volume-100k" => integer().is_some_and(|number| number >= 100_000),
         "soak-90-day" => integer().is_some_and(|number| number >= 90),
-        "sp1-soundness-independent-confirmation"
+        "deterministic-verifier-cost"
+        | "sp1-soundness-independent-confirmation"
         | "solidity-independent-audit"
         | "sp1-guests-independent-audit"
         | "elements-simplicity-independent-audit"
         | "ethereum-client-differential"
-        | "elements-bitcoin-enforcer-differential"
-        | "cross-domain-replay-fuzz" => value == "complete",
+        | "bip300-drivechain-enforcer-differential"
+        | "cross-domain-replay-fuzz"
+        | "deposit-mint-e2e"
+        | "approved-redemption-payout-e2e" => value == "complete",
         _ => false,
     }
 }
@@ -319,7 +338,7 @@ mod tests {
         )
         .unwrap();
         assert!(!report.launch_ready());
-        assert_eq!(report.blocked_count(), 16);
+        assert_eq!(report.blocked_count(), 15);
     }
 
     #[test]
@@ -331,7 +350,7 @@ mod tests {
         }
         let report = GateReport::parse_tsv(&input).unwrap();
         assert!(!report.launch_ready());
-        assert_eq!(report.blocked_count(), 16);
+        assert_eq!(report.blocked_count(), 15);
     }
 
     #[test]
@@ -342,14 +361,10 @@ mod tests {
             input.push_str(id);
             let value = match id {
                 "proof-size" => "524288",
-                "x86-latency" => "500",
-                "arm-latency" => "2000",
                 "peak-memory" => "268435456",
                 "block-weight" => "2500",
                 "evm-gas" => "5000",
-                "full-validity-invalid-block-rejection" => "1000/1000",
-                "volume-100k" => "100000",
-                "soak-90-day" => "90",
+                "bip300-authorization-invalid-rejection" => "1000/1000",
                 _ => "complete",
             };
             input.push_str("\tPASS\t");
@@ -372,14 +387,10 @@ mod tests {
         for id in REQUIRED_LAUNCH_GATES {
             let value = match id {
                 "proof-size" => "524289",
-                "x86-latency" => "500",
-                "arm-latency" => "2000",
                 "peak-memory" => "268435456",
                 "block-weight" => "2500",
                 "evm-gas" => "5000",
-                "full-validity-invalid-block-rejection" => "1000/1000",
-                "volume-100k" => "100000",
-                "soak-90-day" => "90",
+                "bip300-authorization-invalid-rejection" => "1000/1000",
                 _ => "complete",
             };
             input.push_str(id);
@@ -406,5 +417,33 @@ mod tests {
             parsed.verify_evidence_files(Path::new(".")),
             Err(GateError::EvidenceRead { .. })
         ));
+    }
+
+    #[test]
+    fn optional_maturity_observations_do_not_block_launch() {
+        let (directory, evidence) = evidence_fixture();
+        let mut input = String::from("gate\tstatus\tmeasured_value\tevidence\n");
+        for id in REQUIRED_LAUNCH_GATES {
+            let value = match id {
+                "proof-size" => "524288",
+                "peak-memory" => "268435456",
+                "block-weight" => "2500",
+                "evm-gas" => "5000",
+                "bip300-authorization-invalid-rejection" => "1000/1000",
+                _ => "complete",
+            };
+            input.push_str(&format!("{id}\tPASS\t{value}\t{evidence}\n"));
+        }
+        input.push_str("volume-100k\tBLOCKED\t0\tNONE\n");
+        input.push_str("soak-90-day\tBLOCKED\t0\tNONE\n");
+
+        let report = GateReport::parse_tsv(&input)
+            .unwrap()
+            .verify_evidence_files(&directory)
+            .unwrap();
+        assert!(report.launch_ready());
+        assert_eq!(report.blocked_count(), 0);
+        assert!(report.render_text().contains("volume-100k [observation]"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

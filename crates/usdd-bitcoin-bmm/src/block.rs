@@ -17,19 +17,56 @@ use crate::{
 };
 
 mod bip300;
+mod checkpoint;
+mod multislot;
 mod signet;
 
+pub use multislot::{
+    ApprovedMultiSlotM6, MultiSlotActivation, MultiSlotBlockEffects, MultiSlotBmmCommitment,
+    MultiSlotCtip, MultiSlotDeposit, MultiSlotEffectiveM4, MultiSlotEffectiveM4Action,
+    MultiSlotPendingM6id, MultiSlotProposal, MultiSlotReplayError, Slot24UsddContinuity,
+};
+
+#[cfg(feature = "enforcer-differential")]
+pub use multislot::{
+    EnforcerDifferentialActiveSlot, EnforcerDifferentialReplay, EnforcerDifferentialSnapshot,
+};
+
 pub use bip300::{
-    apply_merkle_bound_elements_slot24_parent_block, ElementsSlot24BlockEffects,
+    apply_merkle_bound_elements_slot24_parent_block,
+    apply_merkle_bound_elements_slot24_parent_block_owned,
+    apply_merkle_bound_elements_slot24_parent_block_owned_with_m6_artifact,
+    apply_merkle_bound_elements_slot24_parent_block_with_m6_artifact, ApprovedSlot24AccumulatorM6,
+    ApprovedSlot24NativeWithdrawalM6, EffectiveSlot24M4, ElementsSlot24BlockEffects,
     ElementsSlot24BmmEdge, ElementsSlot24ReplayConfig, ElementsSlot24ReplayError,
-    ElementsSlot24ReplayState, MintableSlot24Deposit, PendingSlot24Proposal, Slot24Ctip,
+    ElementsSlot24ReplayState, MintableSlot24Deposit, PendingSlot24M6id, PendingSlot24Proposal,
+    Slot24AccumulatorIdentity, Slot24ApprovedRoot, Slot24Ctip,
     ELEMENTS_V1_MAX_LIVE_PROPOSAL_BLOCKS, ELEMENTS_V1_REQUIRED_PROPOSAL_HASH_INTERNAL,
-    MAX_PENDING_SLOT24_PROPOSALS,
+    MAX_PENDING_SLOT24_M6IDS, MAX_PENDING_SLOT24_PROPOSALS, SLOT24_M6_INCLUSION_THRESHOLD,
+    SLOT24_M6_MAX_AGE, SLOT24_M6_REQUIRED_SCORE,
+};
+pub use checkpoint::{
+    ProofCheckpointError, ECASH_PROOF_CHECKPOINT_DOMAIN, ECASH_PROOF_CHECKPOINT_MAGIC,
+    ECASH_PROOF_CHECKPOINT_SCHEMA,
 };
 pub use signet::{
-    verify_layer_two_signet_block_solution,
-    verify_layer_two_signet_pow_merkle_bound_elements_m7_successor, LayerTwoSignetError,
-    SignetPowMerkleBoundM7Transition,
+    advance_genesis_derived_layer_two_signet_multislot_replay,
+    advance_genesis_derived_layer_two_signet_replay,
+    advance_layer_two_signet_bmm_confirmation_tracker, initialize_layer_two_signet_genesis_replay,
+    initialize_layer_two_signet_genesis_replay_with_manifest_bound_accumulator,
+    initialize_layer_two_signet_multislot_genesis_replay,
+    initialize_layer_two_signet_multislot_genesis_replay_with_manifest_bound_accumulator,
+    verify_and_bind_layer_two_signet_bmm_confirmation_tracker,
+    verify_and_track_layer_two_signet_approved_slot24_accumulator_m6,
+    verify_and_track_layer_two_signet_multislot_approved_slot24_accumulator_m6,
+    verify_layer_two_signet_block_solution, verify_layer_two_signet_contextual_successor,
+    verify_layer_two_signet_mtp_successor,
+    verify_layer_two_signet_pow_merkle_bound_elements_m7_successor,
+    ApprovedSlot24AccumulatorM6FinalityTracker, ContextualSignetBlockTransition,
+    ContextualSignetError, FinalizedSlot24AccumulatorRoot,
+    GenesisDerivedLayerTwoSignetMultiSlotReplayState, GenesisDerivedLayerTwoSignetReplayState,
+    LayerTwoSignetError, MultiSlotApprovedSlot24AccumulatorM6FinalityTracker,
+    SignetPowMerkleBoundM7Transition, SLOT24_ACCUMULATOR_M6_FINALITY_CONFIRMATIONS,
 };
 
 /// A serialized Bitcoin block can never exceed its maximum weight in bytes.
@@ -109,8 +146,8 @@ pub struct PowMerkleBoundM7 {
 }
 
 impl PowMerkleBoundM7 {
-    /// Require the commitment to equal a child hash independently derived by
-    /// the future full Elements transition verifier.
+    /// Require the commitment to equal an independently supplied child hash.
+    /// This equality does not authorize a USDD redemption.
     pub fn require_validated_child_hash(self, child_hash: BlockHash) -> Result<Self, M7Error> {
         if self.committed_child_hash != child_hash {
             return Err(M7Error::WrongChildHash);
@@ -264,14 +301,19 @@ impl ParsedCoinbase<'_> {
 }
 
 struct ParsedTransaction<'a> {
+    version: [u8; 4],
     txid: BlockHash,
     wtxid: BlockHash,
+    /// Exact transaction bytes as committed by the block Merkle tree. For a
+    /// SegWit transaction this includes marker, flag, and witness data.
+    serialized: &'a [u8],
     stripped_size: usize,
     has_witness: bool,
     is_coinbase: bool,
     coinbase: Option<ParsedCoinbase<'a>>,
     inputs: Vec<[u8; 36]>,
     outputs: Vec<ParsedOutput<'a>>,
+    lock_time: [u8; 4],
 }
 
 fn encode_compact_size(value: usize, out: &mut Vec<u8>) -> Result<(), BlockStructureError> {
@@ -461,14 +503,17 @@ fn parse_transaction<'a>(
     });
 
     Ok(ParsedTransaction {
+        version,
         txid,
         wtxid,
+        serialized: &cursor.bytes[transaction_start..transaction_end],
         stripped_size,
         has_witness: has_witness_encoding,
         is_coinbase,
         coinbase,
         inputs: outpoints,
         outputs,
+        lock_time,
     })
 }
 
@@ -644,10 +689,9 @@ pub fn verify_serialized_block_merkle(
 ///
 /// No output scripts, txids, Merkle branches, difficulty bits, chainwork, or
 /// successor hash are accepted separately from the serialized block and prior
-/// chain state. The future outbound guest must still add the frozen Signet
-/// challenge, contextual header rules, best-work/reorg logic, BIP300 replay,
-/// 100-confirmation tracking, and full Elements validity before authorizing a
-/// burn redemption.
+/// chain state. This M7 primitive is not the redemption boundary: authorization
+/// requires the exact M3/M4/M6 withdrawal-voting transition and M6id-to-claim
+/// binding described in the crate README.
 pub fn verify_pow_merkle_bound_elements_m7_successor(
     prior: &HeaderChainState,
     serialized_block: &[u8],

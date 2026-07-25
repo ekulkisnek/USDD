@@ -49,9 +49,16 @@
       "groth16-wrapper"
     ]
   },
+  "committedCorrectedCapture": {
+    "path": "artifacts/testnet/ecash-m6-transition-20260725/corrected-capture.tar.gz",
+    "bytes": 373893,
+    "sha256": "b0867b3e09a5ab5fbf2613fdf42aa1ff30c3b677150518ee253929a1035967c4",
+    "description": "Immutable corrected proof handoff, including segment/fold ELFs, prepared segment inputs, expected public values, manifest, and SHA256SUMS."
+  },
   "publication": {
     "proofArtifactsCommitted": true,
+    "correctedCaptureCommitted": true,
     "archivesCommitted": false,
-    "note": "Validated proof bytes are committed in proof-artifacts.tar.gz. Operational recovery and incident archives remain local."
+    "note": "Validated proof bytes and the immutable corrected capture are committed. Operational recovery and incident archives remain local."
   }
 }

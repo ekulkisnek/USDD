@@ -18,9 +18,17 @@ The validated proof bytes are committed as:
 
 `artifacts/testnet/ecash-m6-transition-20260725/proof-artifacts.tar.gz`
 
+The immutable corrected capture is committed as:
+
+`artifacts/testnet/ecash-m6-transition-20260725/corrected-capture.tar.gz`
+
 Bundle SHA256:
 
 `aa0cf2a54e36beabf66659911aa45d219e4f12e4fe25da59c3cb01cfd6f4ad54`
+
+Corrected capture SHA256:
+
+`b0867b3e09a5ab5fbf2613fdf42aa1ff30c3b677150518ee253929a1035967c4`
 
 The bundle contains all three segment proof directories, both fold proof
 directories, and the complete Groth16 wrapper directory. Operational recovery
@@ -30,7 +38,9 @@ Verify and inspect it with:
 
 ```bash
 sha256sum artifacts/testnet/ecash-m6-transition-20260725/proof-artifacts.tar.gz
+sha256sum artifacts/testnet/ecash-m6-transition-20260725/corrected-capture.tar.gz
 tar -tzf artifacts/testnet/ecash-m6-transition-20260725/proof-artifacts.tar.gz
+tar -tzf artifacts/testnet/ecash-m6-transition-20260725/corrected-capture.tar.gz
 ```
 
 ## Where to find the validated files
